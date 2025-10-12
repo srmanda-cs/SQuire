@@ -106,7 +106,3 @@ By training LLMs to encode these patterns as first‑class static checkers, we a
 ```
 LLM • Static Analysis • Bug Detection • Coccinelle • Smatch • Gemini 2.5‑Flash • Linux Kernel • AI‑Assisted Tooling
 ```
-
----
-
-Would you like me to make this README a bit more _project‑ready_ (e.g., include installation/setup instructions and a sample directory structure for where you’ll keep your checkers and datasets)?
