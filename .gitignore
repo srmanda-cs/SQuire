@@ -54,11 +54,7 @@ MANIFEST
 
 # -------------------------------------------------------------------
 # 3. Datasets & Large External Codebases
-# Do NOT commit the Linux kernel source code into your repository.
 # -------------------------------------------------------------------
-# The entire Linux kernel repository clone
-/linux/
-
 # Any other large datasets or raw mined data
 /mined_patches_raw/
 /kernel_snapshots/

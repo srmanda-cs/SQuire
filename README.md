@@ -150,3 +150,42 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
 See the License for the specific language governing permissions and limitations under the License.
 ```
+
+---
+
+# Project Setup
+1. Ensure you are on a Linux distro and ensure you have Python, gcc/g++, coccinelle (spatch) all installed before proceeding with any of the setup.
+2. Clone the repository and initialize submodules
+   ```bash
+   git clone https://github.com/srmanda-cs/SQuire.git
+   cd SQuire
+
+   git submodule update --init --recursive
+   ```
+3. Setup a Python virtual environment
+   ```bash
+    python -m venv .venv
+    source .venv/bin/activate
+   ```
+4. Install the project requirements
+   ```bash
+    pip install -r requirements.txt
+    ```
+5. Create a file in the root directory called: .env which would look as follows
+   ```
+    API_KEY=<your_openai_compatible_api_key>
+    BASE_URL=<your_openai_compatible_base_url>
+    LLM_MODEL=<your_chosen_model_name>
+   ```
+6. Run test_llm_response.py inside test/openai_api and make sure you're getting a response back
+7. Run test_rules.cocci inside test/coccinelle using the following command from the root directory:
+   ```bash
+    spatch test/coccinelle/test_rules.cocci test/coccinelle/test_bugs.c
+   ```
+8. You should see the following output:
+    ```bash
+    init_defs_builtins: /usr/lib/ocaml/coccinelle/standard.h
+    HANDLING: test/coccinelle/test_bugs.c
+    Possible unsafe use of malloc'ed variable: ptr at line 9
+    ```
+9. If all tests so far are successful, then it means everything is working! (for now at least...)
