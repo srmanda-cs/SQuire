@@ -1,311 +1,181 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-filter_commits.py
------------------
-Filter commits from the raw mined data to identify potential off-by-one errors.
-Applies multiple configurable filters to reduce ~14K commits to a manageable set.
+src/filter_commits.py
+---------------------
+
+Stage 1: Traverse Linux kernel history between v5.10–v5.17,
+filter commits that modify only a few lines (1–5 added + deleted)
+and aren’t merge/mega commits, cosmetic, or non‑C code.
+
+Stage 2: Run lightweight keyword‑based pattern matching
+to bucket commits under seven bug categories
+listed in src/bug_categories.json.
+
+Output:
+    mined_patches_raw/v5.10_to_v5.17_categorized.json
+Each key = category → list of commits.
+
+Dependencies:
+    pip install gitpython tqdm
 """
 
 import os
-import re
 import json
-import logging
-from typing import List, Dict, Any
-from datetime import datetime
+import re
+from git import Repo
+from tqdm import tqdm
 
-# ------------------------------------------------------------
-# Configuration - Adjust these as needed
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-RAW_DIR = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "mined_patches_raw"))
-FILTERED_DIR = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "mined_patches_curated"))
+BASE_DIR = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+LINUX_PATH = os.path.join(BASE_DIR, "linux")
+OUTPUT_PATH = os.path.join(BASE_DIR, "mined_patches_raw")
+OUTPUT_FILE = os.path.join(OUTPUT_PATH, "v5.10_to_v5.17_categorized.json")
+CATEGORIES_FILE = os.path.join(BASE_DIR, "src", "bug_categories.json")
 
-INPUT_FILE = "all_v5.16_to_v5.17.json"
-OUTPUT_FILE = "filtered_off_by_one.json"
-STATS_FILE = "filter_stats.txt"
-SAMPLE_FILE = "sample_commits.txt"
+START_TAG = "v5.10"
+END_TAG = "v5.17"
 
-# Filter thresholds (configurable)
-CONFIG = {
-    # Filter 1: Line changes
-    "max_lines_changed": 3,  # Option C: 1-3 lines
-    
-    # Filter 2: Keywords in commit message (case-insensitive)
-    "keywords": [
-        "off-by-one", "off by one", "obo",
-        "boundary", "bounds", "bound",
-        "index", "overflow", "underflow",
-        "array out of bounds", "buffer overflow",
-        "out-of-bounds", "out of bounds",
+MAX_LINES_CHANGED = 5     # additions + deletions
+MAX_FILES_CHANGED = 2     # maximum number of files per commit
+ALLOWED_FILE_EXT = (".c", ".h")
+
+TRIVIAL_WORDS = (
+    "typo", "style", "indent", "format", "refactor", "rename",
+    "comment", "documentation", "doc", "docs", "whitespace",
+    "spelling", "reword", "update copyright"
+)
+
+# ---------------------------------------------------------------------------
+# Keyword heuristics per category
+# ---------------------------------------------------------------------------
+
+CATEGORY_KEYWORDS = {
+    "Null-Pointer Dereference (NPD)": [
+        r"\bnull\b", r"== *NULL", r"!= *NULL", r"kmalloc",
+        r"kzalloc", r"devm_kzalloc", r"\bptr\b", r"!.*ptr"
     ],
-    
-    # Filter 3: Boundary operators in diff
-    "boundary_patterns": [
-        r"[<>]=?",  # <, <=, >, >=
-        r"[\+\-]\s*1\b",  # +1, -1
-        r"\bsize\s*-\s*1\b",  # size - 1
-        r"\blen\s*-\s*1\b",  # len - 1
-        r"\blength\s*-\s*1\b",  # length - 1
+    "Use-Before-Intialization (UBI)": [
+        r"uninit", r"initialize", r"= *NULL", r"= *0",
+        r"memset", r"set to 0", r"init"
     ],
-    
-    # Filter 4: Loop/array context keywords
-    "context_keywords": [
-        "for", "while",  # loops
-        "[", "]",  # array access
-        "memcpy", "memset", "kmalloc", "kzalloc",  # memory ops
-        "strlen", "strncpy", "snprintf", "strlcpy",  # string ops
+    "Integer Overflow": [
+        r"overflow", r"INT_MAX", r"UINT_MAX", r"size_t",
+        r"< *0", r">\s*INT_MAX", r"return -EINVAL"
     ],
-    
-    # Filter 5: File types (extensions to include)
-    "file_extensions": [".c", ".h"],
-    
-    # Filter 6: Noise exclusion keywords
-    "exclude_keywords": [
-        "typo", "comment", "whitespace", "formatting",
-        "indentation", "style", "cleanup",
+    "Out-of-Bounds (OOB)": [
+        r"\bindex\b", r"len", r"size", r"count",
+        r"< *len", r">= *len", r"< *size", r">= *size", r"BUFFER_SIZE"
     ],
-    
-    # Filter 7: Size constraints
-    "max_total_loc": 20,  # Total lines changed
-    "max_files_changed": 2,  # Number of files
-    "max_patch_size_kb": 5,  # Patch size in KB
-    
-    # Sample size for manual review
-    "sample_size": 5,
+    "Buffer Overflow": [
+        r"memcpy", r"memmove", r"strcpy", r"strncpy",
+        r"copy_from_user", r"copy_to_user", r"sizeof",
+        r"min\s*\(.*len", r"buf\["
+    ],
+    "Memory Leak": [
+        r"free", r"kfree", r"release", r"cleanup",
+        r"goto err", r"put_device", r"return"
+    ],
+    "Double Free": [
+        r"free", r"kfree", r"ptr = NULL", r"if *\(.*!.*\)"
+    ],
 }
 
-# ------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("filter_commits")
+os.makedirs(OUTPUT_PATH, exist_ok=True)
 
-# ------------------------------------------------------------
-# Filter Functions
-# ------------------------------------------------------------
+# Load configured categories (to preserve order)
+with open(CATEGORIES_FILE, "r", encoding="utf-8") as f:
+    BUG_CATEGORIES = json.load(f)
 
+# Prepare result dictionary
+categorized = {cat: [] for cat in BUG_CATEGORIES}
 
-def filter_line_changes(commit: Dict[str, Any]) -> bool:
-    """Filter 1: Keep commits with 1-3 lines changed."""
-    total_changes = commit["loc_added"] + commit["loc_removed"]
-    return 1 <= total_changes <= CONFIG["max_lines_changed"]
+# Initialize repository
+repo = Repo(LINUX_PATH)
+assert not repo.bare, f"Repository at {LINUX_PATH} not found or invalid."
 
+# Tag range
+start = repo.tags[START_TAG]
+end = repo.tags[END_TAG]
 
-def filter_keywords(commit: Dict[str, Any]) -> bool:
-    """Filter 2: Check for off-by-one keywords in commit message."""
-    text = (commit["subject"] + " " + commit["body"]).lower()
-    return any(kw.lower() in text for kw in CONFIG["keywords"])
+commits = list(repo.iter_commits(f"{start.commit.hexsha}..{end.commit.hexsha}", no_merges=True))
+print(f"Scanning {len(commits)} commits between {START_TAG} and {END_TAG}...")
 
+filtered = []
 
-def filter_boundary_operators(commit: Dict[str, Any]) -> bool:
-    """Filter 3: Check for boundary operator changes in diff."""
-    diff = commit["diff"]
-    for pattern in CONFIG["boundary_patterns"]:
-        if re.search(pattern, diff):
-            return True
-    return False
+# ---------------------------------------------------------------------------
+# Stage 1 — Filter small diffs
+# ---------------------------------------------------------------------------
 
+for commit in tqdm(commits, desc="Filtering small diffs", ncols=100):
+    msg_lower = commit.message.lower()
+    if any(word in msg_lower for word in TRIVIAL_WORDS):
+        continue
 
-def filter_context(commit: Dict[str, Any]) -> bool:
-    """Filter 4: Check for loop/array context in diff."""
-    diff = commit["diff"]
-    return any(kw in diff for kw in CONFIG["context_keywords"])
+    stats = commit.stats.total
+    total_changes = stats["insertions"] + stats["deletions"]
+    total_files = stats["files"]
 
+    if total_changes == 0 or total_changes > MAX_LINES_CHANGED:
+        continue
+    if total_files == 0 or total_files > MAX_FILES_CHANGED:
+        continue
 
-def filter_file_types(commit: Dict[str, Any]) -> bool:
-    """Filter 5: Keep only .c and .h files."""
-    files = commit.get("files_changed", [])
-    if not files:
-        return False
-    return any(
-        any(f.endswith(ext) for ext in CONFIG["file_extensions"])
-        for f in files
-    )
+    changed_files = [f for f in commit.stats.files.keys() if f.endswith(ALLOWED_FILE_EXT)]
+    if not changed_files:
+        continue
+    if not commit.parents:
+        continue
 
+    parent = commit.parents[0]
+    try:
+        diff_text = repo.git.diff(parent.hexsha, commit.hexsha, unified=3)
+    except Exception:
+        continue
 
-def filter_exclude_noise(commit: Dict[str, Any]) -> bool:
-    """Filter 6: Exclude commits with noise keywords."""
-    text = (commit["subject"] + " " + commit["body"]).lower()
-    return not any(kw.lower() in text for kw in CONFIG["exclude_keywords"])
-
-
-def filter_size_constraints(commit: Dict[str, Any]) -> bool:
-    """Filter 7: Apply size constraints."""
-    if commit["total_loc"] > CONFIG["max_total_loc"]:
-        return False
-    if commit["num_files_changed"] > CONFIG["max_files_changed"]:
-        return False
-    patch_size_kb = commit["patch_size_bytes"] / 1024
-    if patch_size_kb > CONFIG["max_patch_size_kb"]:
-        return False
-    return True
-
-
-# ------------------------------------------------------------
-# Main Filtering Pipeline
-# ------------------------------------------------------------
-
-
-def apply_filters(commits: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Apply all filters in sequence and track statistics."""
-    
-    stats = {
-        "total": len(commits),
-        "after_line_changes": 0,
-        "after_keywords": 0,
-        "after_boundary_ops": 0,
-        "after_context": 0,
-        "after_file_types": 0,
-        "after_exclude_noise": 0,
-        "after_size_constraints": 0,
-        "final": 0,
+    entry = {
+        "commit": commit.hexsha,
+        "parent": parent.hexsha,
+        "author": commit.author.name,
+        "email": commit.author.email,
+        "date": commit.committed_datetime.isoformat(),
+        "message": commit.message.strip(),
+        "files_changed": changed_files,
+        "insertions": stats["insertions"],
+        "deletions": stats["deletions"],
+        "diff": diff_text,
     }
-    
-    log.info(f"Starting with {stats['total']} commits")
-    
-    # Filter 1: Line changes
-    commits = [c for c in commits if filter_line_changes(c)]
-    stats["after_line_changes"] = len(commits)
-    log.info(f"After line changes filter: {len(commits)} commits")
-    
-    # Filter 2: Keywords
-    commits = [c for c in commits if filter_keywords(c)]
-    stats["after_keywords"] = len(commits)
-    log.info(f"After keywords filter: {len(commits)} commits")
-    
-    # Filter 3: Boundary operators
-    commits = [c for c in commits if filter_boundary_operators(c)]
-    stats["after_boundary_ops"] = len(commits)
-    log.info(f"After boundary operators filter: {len(commits)} commits")
-    
-    # Filter 4: Context
-    commits = [c for c in commits if filter_context(c)]
-    stats["after_context"] = len(commits)
-    log.info(f"After context filter: {len(commits)} commits")
-    
-    # Filter 5: File types
-    commits = [c for c in commits if filter_file_types(c)]
-    stats["after_file_types"] = len(commits)
-    log.info(f"After file types filter: {len(commits)} commits")
-    
-    # Filter 6: Exclude noise
-    commits = [c for c in commits if filter_exclude_noise(c)]
-    stats["after_exclude_noise"] = len(commits)
-    log.info(f"After exclude noise filter: {len(commits)} commits")
-    
-    # Filter 7: Size constraints
-    commits = [c for c in commits if filter_size_constraints(c)]
-    stats["after_size_constraints"] = len(commits)
-    log.info(f"After size constraints filter: {len(commits)} commits")
-    
-    stats["final"] = len(commits)
-    
-    return commits, stats
 
+    filtered.append(entry)
 
-def save_stats(stats: Dict[str, int], output_path: str):
-    """Save filtering statistics to a text file."""
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("=" * 60 + "\n")
-        f.write("COMMIT FILTERING STATISTICS\n")
-        f.write("=" * 60 + "\n\n")
-        
-        f.write(f"Total commits:                    {stats['total']:>6}\n")
-        f.write(f"After line changes (1-3):         {stats['after_line_changes']:>6}\n")
-        f.write(f"After keywords:                   {stats['after_keywords']:>6}\n")
-        f.write(f"After boundary operators:         {stats['after_boundary_ops']:>6}\n")
-        f.write(f"After context (loops/arrays):     {stats['after_context']:>6}\n")
-        f.write(f"After file types (.c/.h):         {stats['after_file_types']:>6}\n")
-        f.write(f"After exclude noise:              {stats['after_exclude_noise']:>6}\n")
-        f.write(f"After size constraints:           {stats['after_size_constraints']:>6}\n")
-        f.write(f"\nFINAL FILTERED COMMITS:           {stats['final']:>6}\n")
-        
-        reduction = (1 - stats['final'] / stats['total']) * 100
-        f.write(f"\nReduction: {reduction:.1f}%\n")
-        f.write("=" * 60 + "\n")
+print(f"✅ Stage 1 complete — {len(filtered)} small commits retained")
 
+# ---------------------------------------------------------------------------
+# Stage 2 — Keyword-based classification (first match only)
+# ---------------------------------------------------------------------------
 
-def save_samples(commits: List[Dict[str, Any]], output_path: str, n: int = 5):
-    """Save sample commits for manual review."""
-    samples = commits[:min(n, len(commits))]
-    
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("=" * 80 + "\n")
-        f.write(f"SAMPLE COMMITS (First {len(samples)})\n")
-        f.write("=" * 80 + "\n\n")
-        
-        for i, commit in enumerate(samples, 1):
-            f.write(f"\n{'=' * 80}\n")
-            f.write(f"SAMPLE {i}/{len(samples)}\n")
-            f.write(f"{'=' * 80}\n\n")
-            f.write(f"SHA:     {commit['sha']}\n")
-            f.write(f"Author:  {commit['author']}\n")
-            f.write(f"Date:    {commit['date']}\n")
-            f.write(f"Subject: {commit['subject']}\n\n")
-            f.write(f"Files changed: {commit['num_files_changed']}\n")
-            f.write(f"LOC added:     {commit['loc_added']}\n")
-            f.write(f"LOC removed:   {commit['loc_removed']}\n")
-            f.write(f"Total LOC:     {commit['total_loc']}\n\n")
-            f.write("DIFF:\n")
-            f.write("-" * 80 + "\n")
-            f.write(commit['diff'][:1000])  # First 1000 chars
-            if len(commit['diff']) > 1000:
-                f.write("\n... [truncated] ...\n")
-            f.write("\n")
+for commit in tqdm(filtered, desc="Classifying commits", ncols=100):
+    text = (commit["message"] + "\n" + commit["diff"]).lower()
+    # Stop at first matching category to avoid duplicates
+    for cat in BUG_CATEGORIES:
+        regexes = CATEGORY_KEYWORDS.get(cat, [])
+        if any(re.search(rgx, text) for rgx in regexes):
+            categorized[cat].append(commit)
+            break
 
+# ---------------------------------------------------------------------------
+# Stage 3 — Save final categorized file
+# ---------------------------------------------------------------------------
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
+with open(OUTPUT_FILE, "w", encoding="utf-8", errors="replace") as f:
+    json.dump(categorized, f, indent=2, ensure_ascii=False)
 
-
-def main():
-    t0 = datetime.now()
-    log.info("=" * 60)
-    log.info("SQuire: Filter Commits for Off-by-One Errors")
-    log.info("=" * 60)
-    
-    # Load raw commits
-    input_path = os.path.join(RAW_DIR, INPUT_FILE)
-    log.info(f"Loading commits from: {input_path}")
-    
-    with open(input_path, "r", encoding="utf-8") as f:
-        commits = json.load(f)
-    
-    log.info(f"Loaded {len(commits)} commits")
-    
-    # Apply filters
-    filtered_commits, stats = apply_filters(commits)
-    
-    # Create output directory
-    os.makedirs(FILTERED_DIR, exist_ok=True)
-    
-    # Save filtered commits
-    output_path = os.path.join(FILTERED_DIR, OUTPUT_FILE)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(filtered_commits, f, indent=2)
-    log.info(f"Saved {len(filtered_commits)} filtered commits to: {output_path}")
-    
-    # Save statistics
-    stats_path = os.path.join(FILTERED_DIR, STATS_FILE)
-    save_stats(stats, stats_path)
-    log.info(f"Saved statistics to: {stats_path}")
-    
-    # Save samples
-    sample_path = os.path.join(FILTERED_DIR, SAMPLE_FILE)
-    save_samples(filtered_commits, sample_path, CONFIG["sample_size"])
-    log.info(f"Saved {min(CONFIG['sample_size'], len(filtered_commits))} sample commits to: {sample_path}")
-    
-    dt = (datetime.now() - t0).total_seconds()
-    log.info(f"Completed in {dt:.1f}s")
-    log.info("=" * 60)
-
-
-if __name__ == "__main__":
-    main()
+# Unique commit count sanity check
+unique_hashes = {c["commit"] for lst in categorized.values() for c in lst}
+print(f"\n✅ Stage 2 complete — {len(unique_hashes)} unique commits auto‑categorized "
+      f"across {len(BUG_CATEGORIES)} categories")
+print(f"📦 Output → {OUTPUT_FILE}")
