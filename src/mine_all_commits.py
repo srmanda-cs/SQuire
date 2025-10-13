@@ -5,30 +5,28 @@ mine_all_commits.py
 -------------------
 Collect *all* commits in a Linux kernel tag range, extract subject, body,
 author, diff, and basic LOC stats, and store as a single JSON file.
-
-This version does NO keyword filtering, NO bug-class grouping.
-Used as the first stage before semantic filtering (e.g., MiniLM).
-
-Usage:
-    python3 src/mine_all_commits.py
 """
 
-import os, json, subprocess, logging
+import os
+import re
+import json
+import subprocess
+import logging
 from datetime import datetime
 from typing import List, Dict, Any
+from tqdm import tqdm
 
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
 
 LINUX_REPO = os.path.join(os.path.dirname(__file__), "..", "linux")
-RAW_DIR    = os.path.join(os.path.dirname(__file__), "..", "mined_patches_raw")
+RAW_DIR = os.path.join(os.path.dirname(__file__), "..", "mined_patches_raw")
 
-TAG_START  = "v5.16"
-TAG_END    = "v5.17"
+TAG_START = "v5.16"
+TAG_END = "v5.17"
 
-MAX_TOTAL_LOC = 1000    # optional safety cap, large patches truncated
-SAVE_EVERY    = 500     # commits between progress reports
+MAX_TOTAL_LOC = 1000  # truncate large diffs for sanity
 
 # ------------------------------------------------------------
 # Logging
@@ -37,13 +35,14 @@ SAVE_EVERY    = 500     # commits between progress reports
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S"
+    datefmt="%H:%M:%S",
 )
 log = logging.getLogger("mine_all_commits")
 
 # ------------------------------------------------------------
 # Utilities
 # ------------------------------------------------------------
+
 
 def git(args: List[str], cwd: str = LINUX_REPO) -> str:
     """Run a git command in the Linux repo and return stdout."""
@@ -68,45 +67,82 @@ def get_commits(start_tag: str, end_tag: str) -> List[str]:
 
 
 def extract_one(sha: str) -> Dict[str, Any]:
-    """Extract metadata and diff for one commit."""
-    fmt = "%H%n%an%n%ad%n%s%n%b"
-    raw = git(["show", sha, f"--pretty=format:{fmt}", "--patch", "--no-color"])
-    lines = raw.splitlines()
+    """Extract metadata, stats, and diff for one commit."""
 
-    def pop_line():
-        return lines.pop(0).strip() if lines else ""
+    # --- core metadata ---
+    parent = git(["rev-parse", f"{sha}^"]).strip()
+    parents = git(["rev-list", "--parents", "-n", "1", sha]).split()[1:]
+    author = git(["show", "-s", "--format=%an", sha]).strip()
+    email = git(["show", "-s", "--format=%ae", sha]).strip()
+    date = git(["show", "-s", "--format=%ad", sha]).strip()
+    subject = git(["show", "-s", "--format=%s", sha]).strip()
+    body = git(["show", "-s", "--format=%b", sha]).strip()
 
-    sha_line = pop_line()
-    author   = pop_line()
-    date     = pop_line()
-    subject  = pop_line()
+    # --- diff & file list ---
+    diff = git(["show", sha, "--patch", "--no-color"])
+    files = [m[1] for m in re.findall(r"diff --git a/(.*?) b/(.*?)\n", diff)]
+    num_files = len(files)
 
-    # find start of diff
-    diff_idx = next((i for i, l in enumerate(lines) if l.startswith("diff --git")), len(lines))
-    body = "\n".join(lines[:diff_idx]).strip()
-    diff = "\n".join(lines[diff_idx:])
-
-    add_count = sum(1 for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
-    del_count = sum(1 for l in diff.splitlines() if l.startswith("-") and not l.startswith("---"))
+    add_count = sum(
+        1 for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")
+    )
+    del_count = sum(
+        1 for l in diff.splitlines() if l.startswith("-") and not l.startswith("---")
+    )
     total_loc = add_count + del_count
 
+    diff_truncated = False
     if total_loc > MAX_TOTAL_LOC:
+        diff_truncated = True
         diff = "\n".join(diff.splitlines()[:MAX_TOTAL_LOC]) + "\n... [truncated]"
 
+    # --- quick heuristics ---
+    diff_lower = diff.lower()
+    contains_loop = any(k in diff_lower for k in ["for(", "while("])
+    contains_pointer = "*" in diff or "->" in diff
+    contains_bound = any(k in diff for k in ["<=", ">=", "<", ">"])
+
+    tags = []
+    if re.search(r"off.?by.?one", subject, re.I):
+        tags.append("off-by-one")
+    if contains_bound:
+        tags.append("bounds")
+    if contains_loop:
+        tags.append("loop")
+
     return {
-        "sha": sha_line,
+        "sha": sha,
+        "parent": parent,
+        "parents": parents,
         "author": author,
+        "email": email,
         "date": date,
         "subject": subject,
         "body": body,
+        "diff": diff,
+        "files_changed": files,
+        "num_files_changed": num_files,
         "loc_added": add_count,
         "loc_removed": del_count,
-        "diff": diff,
+        "total_loc": total_loc,
+        "diff_truncated": diff_truncated,
+        "patch_size_bytes": len(diff.encode("utf-8")),
+        "is_merge": len(parents) > 1,
+        "is_revert": subject.lower().startswith("revert"),
+        "tags": tags,
+        "contains_loop_keywords": contains_loop,
+        "contains_pointer_ops": contains_pointer,
+        "contains_bound_ops": contains_bound,
+        "repo_path": LINUX_REPO,
+        "tag_start": TAG_START,
+        "tag_end": TAG_END,
     }
+
 
 # ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
+
 
 def main():
     t0 = datetime.now()
@@ -115,22 +151,23 @@ def main():
     log.info(f"Range: {TAG_START} → {TAG_END}")
 
     commits = get_commits(TAG_START, TAG_END)
-    mined = []
-
-    for i, sha in enumerate(commits, start=1):
-        try:
-            data = extract_one(sha)
-            # skip merges — they’re mostly noise for bug‑fix training
-            if data["subject"].startswith("Merge"):
-                continue
-            mined.append(data)
-        except Exception as e:
-            log.warning(f"⚠️  Failed {sha[:8]}: {e}")
-        if i % SAVE_EVERY == 0:
-            log.info(f"Processed {i}/{len(commits)} commits …")
+    mined: list[dict[str, Any]] = []
 
     out_path = os.path.join(RAW_DIR, f"all_{TAG_START}_to_{TAG_END}.json")
     os.makedirs(RAW_DIR, exist_ok=True)
+
+    with tqdm(total=len(commits), desc="Mining commits", unit="commit") as pbar:
+        for sha in commits:
+            try:
+                data = extract_one(sha)
+                if data["subject"].startswith("Merge"):
+                    pbar.update(1)
+                    continue
+                mined.append(data)
+            except Exception as e:
+                log.warning(f"⚠️  Failed {sha[:8]}: {e}")
+            pbar.update(1)
+
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(mined, f, indent=2)
 
