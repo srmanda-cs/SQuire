@@ -1,0 +1,9 @@
+[
+  "Null-Pointer Dereference (NPD)",
+  "Use-Before-Intialization (UBI)",
+  "Integer Overflow",
+  "Out-of-Bounds (OOB)",
+  "Buffer Overflow",
+  "Memory Leak",
+  "Double Free"
+]

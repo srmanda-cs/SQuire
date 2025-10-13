@@ -74,7 +74,6 @@ MANIFEST
 /triage_reports/
 *.log
 *.csv
-*.json
 # Be more specific if you want to track certain JSON/CSV files (like your curated dataset)
 # For example:
 # !my_curated_dataset.json
