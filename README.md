@@ -154,7 +154,7 @@ See the License for the specific language governing permissions and limi
 ---
 
 # Project Setup
-1. Ensure you are on a Linux distro and ensure you have Python, gcc/g++, coccinelle (spatch) all installed before proceeding with any of the setup.
+1. Ensure you are on a Linux distro and ensure you have Python, gcc/g++, clang, llvm, git, coccinelle all installed before proceeding with any of the setup.
 2. Clone the repository and initialize submodules
    ```bash
    git clone https://github.com/srmanda-cs/SQuire.git
