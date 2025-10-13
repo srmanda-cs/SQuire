@@ -20,8 +20,8 @@ from tqdm import tqdm
 # Configuration
 # ------------------------------------------------------------
 
-LINUX_REPO = os.path.join(os.path.dirname(__file__), "..", "linux")
-RAW_DIR = os.path.join(os.path.dirname(__file__), "..", "mined_patches_raw")
+LINUX_REPO = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "linux"))
+RAW_DIR = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "mined_patches_raw"))
 
 TAG_START = "v5.16"
 TAG_END = "v5.17"
