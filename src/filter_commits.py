@@ -1,27 +1,16 @@
 #!/usr/bin/env python3
 """
-src/filter_commits.py
----------------------
+src/filter_commits.py (multi‑category version)
+----------------------------------------------
 
-Stage 1: Traverse Linux kernel history between v5.10–v5.17,
-filter commits that modify only a few lines (1–5 added + deleted)
-and aren’t merge/mega commits, cosmetic, or non‑C code.
-
-Stage 2: Run lightweight keyword‑based pattern matching
-to bucket commits under seven bug categories
-listed in src/bug_categories.json.
+Each commit may belong to several categories if its diff/message
+matches multiple keyword sets.
 
 Output:
     mined_patches_raw/v5.10_to_v5.17_categorized.json
-Each key = category → list of commits.
-
-Dependencies:
-    pip install gitpython tqdm
 """
 
-import os
-import json
-import re
+import os, json, re
 from git import Repo
 from tqdm import tqdm
 
@@ -35,11 +24,9 @@ OUTPUT_PATH = os.path.join(BASE_DIR, "mined_patches_raw")
 OUTPUT_FILE = os.path.join(OUTPUT_PATH, "v5.10_to_v5.17_categorized.json")
 CATEGORIES_FILE = os.path.join(BASE_DIR, "src", "bug_categories.json")
 
-START_TAG = "v5.10"
-END_TAG = "v5.17"
-
-MAX_LINES_CHANGED = 5     # additions + deletions
-MAX_FILES_CHANGED = 2     # maximum number of files per commit
+START_TAG, END_TAG = "v5.10", "v5.17"
+MAX_LINES_CHANGED = 5
+MAX_FILES_CHANGED = 2
 ALLOWED_FILE_EXT = (".c", ".h")
 
 TRIVIAL_WORDS = (
@@ -47,10 +34,6 @@ TRIVIAL_WORDS = (
     "comment", "documentation", "doc", "docs", "whitespace",
     "spelling", "reword", "update copyright"
 )
-
-# ---------------------------------------------------------------------------
-# Keyword heuristics per category
-# ---------------------------------------------------------------------------
 
 CATEGORY_KEYWORDS = {
     "Null-Pointer Dereference (NPD)": [
@@ -87,21 +70,17 @@ CATEGORY_KEYWORDS = {
 
 os.makedirs(OUTPUT_PATH, exist_ok=True)
 
-# Load configured categories (to preserve order)
+# Load category order
 with open(CATEGORIES_FILE, "r", encoding="utf-8") as f:
     BUG_CATEGORIES = json.load(f)
 
-# Prepare result dictionary
 categorized = {cat: [] for cat in BUG_CATEGORIES}
 
-# Initialize repository
 repo = Repo(LINUX_PATH)
 assert not repo.bare, f"Repository at {LINUX_PATH} not found or invalid."
 
-# Tag range
 start = repo.tags[START_TAG]
 end = repo.tags[END_TAG]
-
 commits = list(repo.iter_commits(f"{start.commit.hexsha}..{end.commit.hexsha}", no_merges=True))
 print(f"Scanning {len(commits)} commits between {START_TAG} and {END_TAG}...")
 
@@ -110,7 +89,6 @@ filtered = []
 # ---------------------------------------------------------------------------
 # Stage 1 — Filter small diffs
 # ---------------------------------------------------------------------------
-
 for commit in tqdm(commits, desc="Filtering small diffs", ncols=100):
     msg_lower = commit.message.lower()
     if any(word in msg_lower for word in TRIVIAL_WORDS):
@@ -119,27 +97,23 @@ for commit in tqdm(commits, desc="Filtering small diffs", ncols=100):
     stats = commit.stats.total
     total_changes = stats["insertions"] + stats["deletions"]
     total_files = stats["files"]
-
     if total_changes == 0 or total_changes > MAX_LINES_CHANGED:
         continue
     if total_files == 0 or total_files > MAX_FILES_CHANGED:
         continue
 
     changed_files = [f for f in commit.stats.files.keys() if f.endswith(ALLOWED_FILE_EXT)]
-    if not changed_files:
-        continue
-    if not commit.parents:
+    if not changed_files or not commit.parents:
         continue
 
-    parent = commit.parents[0]
     try:
-        diff_text = repo.git.diff(parent.hexsha, commit.hexsha, unified=3)
+        diff_text = repo.git.diff(commit.parents[0].hexsha, commit.hexsha, unified=3)
     except Exception:
         continue
 
-    entry = {
+    filtered.append({
         "commit": commit.hexsha,
-        "parent": parent.hexsha,
+        "parent": commit.parents[0].hexsha,
         "author": commit.author.name,
         "email": commit.author.email,
         "date": commit.committed_datetime.isoformat(),
@@ -148,34 +122,36 @@ for commit in tqdm(commits, desc="Filtering small diffs", ncols=100):
         "insertions": stats["insertions"],
         "deletions": stats["deletions"],
         "diff": diff_text,
-    }
-
-    filtered.append(entry)
+    })
 
 print(f"✅ Stage 1 complete — {len(filtered)} small commits retained")
 
 # ---------------------------------------------------------------------------
-# Stage 2 — Keyword-based classification (first match only)
+# Stage 2 — Multi‑category classification
 # ---------------------------------------------------------------------------
 
 for commit in tqdm(filtered, desc="Classifying commits", ncols=100):
     text = (commit["message"] + "\n" + commit["diff"]).lower()
-    # Stop at first matching category to avoid duplicates
-    for cat in BUG_CATEGORIES:
-        regexes = CATEGORY_KEYWORDS.get(cat, [])
+    matched = False
+    for cat, regexes in CATEGORY_KEYWORDS.items():
         if any(re.search(rgx, text) for rgx in regexes):
             categorized[cat].append(commit)
-            break
+            matched = True
+    # you can track unmatched ones if desired
+    # if not matched: Uncategorized.append(commit)
 
 # ---------------------------------------------------------------------------
-# Stage 3 — Save final categorized file
+# Stage 3 — Save + summaries
 # ---------------------------------------------------------------------------
-
 with open(OUTPUT_FILE, "w", encoding="utf-8", errors="replace") as f:
     json.dump(categorized, f, indent=2, ensure_ascii=False)
 
-# Unique commit count sanity check
-unique_hashes = {c["commit"] for lst in categorized.values() for c in lst}
-print(f"\n✅ Stage 2 complete — {len(unique_hashes)} unique commits auto‑categorized "
-      f"across {len(BUG_CATEGORIES)} categories")
-print(f"📦 Output → {OUTPUT_FILE}")
+unique_commits = {c["commit"] for lst in categorized.values() for c in lst}
+
+print(f"\n✅ Stage 2 complete — {len(unique_commits)} unique commits across "
+      f"{len(BUG_CATEGORIES)} categories (multi‑label)")
+print(f"📦 Output → {OUTPUT_FILE}\n")
+
+# Per‑category summary
+for cat in BUG_CATEGORIES:
+    print(f"{cat:<35} {len(categorized[cat]):5d}")
