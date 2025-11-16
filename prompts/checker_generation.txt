@@ -1,0 +1,104 @@
+# Instruction
+Generate a **complete compilable C++ source** for a **Clang‑Static‑Analyzer (CSA)** checker.
+
+# Modern LLVM 20.1 API Notes
+- Use C++17 features (std::optional, std::make_unique, etc.).
+- DO NOT use `llvm::Optional` or `Optional<T>`; use `std::optional<T>` instead.
+- DO NOT use StringRef.equals / startswith / endswith.
+  • Use Name == "str" for equality comparison.
+  • Use Name.starts_with("prefix") or Name.ends_with("suffix").
+- `loc::MemRegionVal` and `nonloc::ConcreteInt` are part of clang::ento::; 
+  use `.getAs<loc::MemRegionVal>()` directly and handle its possible std::optional.
+- For string tests, prefer: `if (Name.equals_insensitive("..."))` only if available,
+  else use `Name.starts_with("...")`, `Name.ends_with("...")`, `Name == "..."`.
+- Clang headers already use `std::optional`, `llvm::StringRef::starts_with`, `ends_with`, not older aliases.
+
+# Modern Checker API rules
+- The checker class must declare callbacks using the official CSA callback tags:
+    class NPDChecker : public Checker<
+        check::PostCall,
+        check::PreStmt<BinaryOperator>,
+        check::PreStmt<MemberExpr>,
+        check::PreStmt<ArraySubscriptExpr>,
+        check::DeadSymbols> { ... }
+
+- Never list identifiers such as "checkPostCall" or "checkPreStmt" unqualified.
+  Use the fully qualified form check::<callback>.
+
+- When reporting, use:
+    auto Rpt = std::make_unique<PathSensitiveBugReport>(*BT, "message", N);
+    C.emitReport(std::move(Rpt));
+
+- Include all required modern headers:
+    #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+    #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+    #include "clang/StaticAnalyzer/Core/PathSensitive/SVals.h"
+
+- Construct BugType as:
+    BT = std::make_unique<BugType>(this, "Unchecked NULL pointer dereference", "Nullability");
+
+- Do NOT define custom structs such as "RegionState" or your own ImmutableMap.
+  Instead, use ProgramStateRef with a simple `REGISTER_MAP_WITH_PROGRAMSTATE` trait
+  mapping `const MemRegion *` to `int` or a custom enum.
+
+- Every ProgramStateTrait must follow the current macro form:
+    REGISTER_MAP_WITH_PROGRAMSTATE(RegionNullness, const MemRegion *, int)
+  and used via `State->get<RegionNullness>()`, etc.
+
+LLVM/CLANG ENVIRONMENT
+- LLVM/Clang Version: 20.1.8
+- OS: Manjaro Linux
+- Header root: /usr/include
+- Registry header path: clang/StaticAnalyzer/Frontend/CheckerRegistry.h
+- Build command:
+    clang++ -fPIC -shared -fno-rtti -std=c++17 -I/usr/include GeneratedNPDChecker.cpp -o libNPDChecker.so
+
+GUIDELINES
+1. Output **only valid compilable C++** — no comments, markdown, or explanation.
+2. Required includes (no others unless needed to compile):
+   #include "clang/StaticAnalyzer/Core/Checker.h"
+   #include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+   #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+   #include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+   #include <optional>
+   #include <memory>
+3. Do **not** include:
+   - clang/StaticAnalyzer/Core/CheckerRegistry.h   (wrong path on this system)
+4. Follow this template:
+
+namespace {
+class NPDChecker : public Checker< {{Callback Functions}} > {
+  mutable std::unique_ptr<BugType> BT;
+public:
+  NPDChecker() : BT(std::make_unique<BugType>(
+      this, "Unchecked NULL pointer dereference", "Nullability")) {}
+  {{Declaration of Callback Functions}}
+private:
+  {{Helper Function Declarations}}
+};
+{{Helper Function Definitions}}
+} // namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<NPDChecker>(
+      "squire.NPDChecker", "Detect unchecked NULL pointer dereferences", "");
+}
+
+5. Implement logic for:
+   • checkPostCall  → track kmalloc/kzalloc/kvmalloc return value as MaybeNull  
+   • checkBranchCondition → detect if(ptr)/if(!ptr) and mark pointer CheckedNonNull  
+   • checkBind → propagate null state between pointer aliases  
+   • checkLocation → warn when MaybeNull pointer is dereferenced  
+6. Keep it < 200 lines, avoid custom ProgramStateTrait if trivial.
+7. Code must compile cleanly with the build command above.
+
+Avoid defining any internal struct with llvm::ImmutableMap unless strictly required.
+Use built‑in ProgramStateRef maps instead.
+Use REGISTER_MAP_WITH_PROGRAMSTATE instead of declaring your own trait.
+Avoid defining a class with methods add / lookup / remove on its own.
+
+# Target Pattern
+{{BUG_PATTERN}}
+
+# Checker Plan
+{{PLAN_TEXT}}

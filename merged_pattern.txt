@@ -1,0 +1,59 @@
+Generalized rule: Ensure proven non-NULL before first use of pointers that may be absent, optional, or come from fallible providers
+
+Summary
+Any pointer originating from a source that can yield NULL (or a special “not present” sentinel) must be proven non-NULL along all control-flow paths before its first use (dereference, indexing, field access, pointer arithmetic, or passing to APIs that require a valid pointer). Partial or misplaced guards are insufficient: the non-NULL check must dominate all uses within the relevant scope/iteration. This applies equally to heap allocations, memory-mapped I/O mappings, bus match data, optional subsystem properties/descriptors, and pointers later checked for NULL.
+
+Scope of sources
+Track pointers obtained from:
+- Memory allocators and mappers that can return NULL:
+  - kmalloc/kzalloc/kmalloc_array/kcalloc, kvmalloc/vmalloc/vzalloc, devm_kmalloc/devm_kzalloc, ioremap/devm_ioremap and variants.
+- Device/bus match data that can be NULL:
+  - id->driver_data, platform_device_id::driver_data, usb_device_id::driver_info, of_/acpi_/device_get_match_data and equivalents.
+- Optional/conditionally-attached subsystem objects:
+  - DRM properties (e.g., *_property fields), optional GPIO descriptors via gpiod_get_optional/devm_gpiod_get_optional, other “optional get” APIs returning NULL when absent.
+- Any pointer later explicitly NULL-checked:
+  - If code tests p for NULL later, flag any dereference occurring before the dominating check.
+
+What counts as “use”
+- Direct dereference: *p, p->field, p[i], pointer arithmetic used for access.
+- Passing to functions that expect valid memory/MMIO/object (e.g., memcpy, readl/writel, drm_object_property_set_value, gpiod_to_irq, synchronization initializers).
+- Interprocedural: passing to callees that (by spec or common contract) require non-NULL; absence of a prior dominating NULL-check is suspicious.
+
+Dominance requirement
+- The first dereference/use must be post-dominated by a check that establishes p != NULL on every path reaching the use.
+- In loops/iterations, ensure the non-NULL guard covers all uses in that iteration. Partial guards (checking p for some uses but not all) are violations; prefer early-continue on NULL or a single encompassing if (p) block.
+
+Specialized sub-rules/heuristics
+- Array allocators: if the result is later indexed (p[i]) before a dominating NULL-check, report.
+- Optional-return APIs (e.g., gpiod_get_optional):
+  - Distinguish three states: NULL (optional and absent), ERR_PTR (error), valid pointer. Require explicit handling of NULL separate from IS_ERR before use.
+- Match-data pointers: if the match table contains entries where data is 0/unspecified, require a NULL check before dereference in probe/init paths.
+- Optional properties (DRM and similar): fields commonly named *_property may be unassigned; require non-NULL guard before setter APIs.
+
+Common anti-patterns to flag
+- Allocate/map then immediately use without check.
+- Check p for NULL only around an early call, then later unguarded p->field use.
+- Initialize locals from p->field before the NULL check on p.
+- Only checking IS_ERR on an API that can also return NULL to mean “absent,” then using the pointer.
+
+Fix patterns
+- Immediately after obtaining the pointer, check:
+  - if (!p) handle/return (-ENOMEM/-EINVAL or skip if optional absent).
+  - For optional-get APIs: if (IS_ERR(p)) handle error; else if (!p) treat as absent and do not use; else use.
+- In loops, either:
+  - if (!p) continue; or
+  - Wrap all uses in if (p) { … }.
+- Ensure the chosen guard dominates all subsequent uses along every path.
+
+Checker implementation outline
+- Taint/label pointers from the listed sources as “possibly NULL.”
+- Build a control-flow graph and compute dominance/post-dominance of non-NULL conditions for each use site.
+- Recognize guards: if (p), if (p != NULL), IS_ERR_OR_NULL for APIs supporting ERR_PTR, switch/case patterns that imply non-NULL, and early-continue/break/return forms.
+- Interprocedural awareness: treat passing tainted pointers to known non-NULL-requiring APIs as a use; optionally model common kernel APIs’ expectations.
+- For optional-get APIs, require a tri-state handling pattern; flag code that only checks IS_ERR before use.
+- Reduce false positives by:
+  - Respecting proven non-NULL invariants (e.g., allocation with __GFP_NOFAIL if applicable and honored, though many kernel allocators can still fail).
+  - Tracking reassignment that clears the taint after a successful check.
+
+Goal
+Prevent NULL-pointer dereferences stemming from unchecked fallible/optional pointer sources or from guards that do not dominate all uses.

@@ -1,0 +1,20 @@
+# Instruction
+Please organize an **elaborate plan** to help write a Clang Static Analyzer (CSA)
+checker to detect such **bug pattern**.
+
+Your plan should describe:
+1. The core logic the checker should capture.
+2. The program states and data structures to maintain.
+3. The callback functions (e.g., checkPostCall, checkBranchCondition, checkLocation, checkBind)
+   that will be used and their purposes.
+4. The sequence of steps the checker performs to mark, validate, or report a violation.
+
+# Utility Functions
+You may assume helper functions like:
+- getMemRegionFromExpr()
+- markRegionChecked()
+- reportUncheckedDereference()
+- ExprHasName()
+
+# Target Pattern
+{{BUG_PATTERN}}

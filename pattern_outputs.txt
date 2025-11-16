@@ -1,0 +1,124 @@
+Bug pattern: Missing NULL-check after allocation with kvmalloc_array (or similar allocators) before dereferencing
+
+- Context: A buffer is allocated with kvmalloc_array() (or kmalloc_array/kvmalloc/kmalloc/vmalloc) and immediately used without verifying the return value.
+- Root cause: kvmalloc_array() can return NULL on allocation failure. If the code proceeds to use the returned pointer (e.g., index into it, pass to functions expecting valid memory), it can dereference a NULL pointer, causing a crash.
+- Concrete instance: pcpu_sum = kvmalloc_array(...); followed by netvsc_get_pcpu_stats(dev, pcpu_sum) and indexing without checking pcpu_sum for NULL.
+- Fix: Add a NULL check immediately after the allocation and return/handle error before any use.
+
+Reusable detection rule for a static analyzer:
+- Identify calls to allocation functions that can return NULL (e.g., kmalloc, kvmalloc, kmalloc_array, kvmalloc_array, vmalloc, vzalloc, devm_* variants where applicable).
+- If the return value is a pointer and within the same function/control-flow path there is any dereference, indexing, or use as a non-NULL argument prior to a NULL-check, flag it.
+- Be sensitive to interprocedural use: passing the pointer to another function without prior NULL-check is also a potential dereference if the callee expects non-NULL.
+- Specialize for array allocators: if the pointer is later indexed (ptr[i]) or pointer arithmetic is applied before a NULL-check, report.
+- Consider GFP flags do not change the necessity of checking; GFP_KERNEL allocations can fail.
+
+This pattern aims to prevent NULL-pointer dereferences originating from unchecked memory allocation failures.
+
+Bug pattern: Using a pointer after a conditional that only guarded some accesses, leaving later unguarded dereferences when the pointer can be NULL.
+
+Details:
+- In a loop over an array of pointers (rings), the code checked if (ring) only around an initial stats fetch, but unconditionally used ring afterward to update aggregate stats (e.g., ring->tx_stats.restart_q).
+- If ring is NULL, the guarded call is skipped, but later unguarded dereferences still occur, causing a NULL pointer dereference.
+
+Reusable detection rule:
+- For a pointer P loaded from a container/array (possibly via READ_ONCE), if any branch or condition checks P for NULL and only guards some operations, then any subsequent dereference of P in the same iteration/scope must also be dominated by the same non-NULL condition. Flag cases where:
+  - P is tested for non-NULL only around a subset of uses, and
+  - There exists at least one dereference of P outside the non-NULL-dominated region in the same control flow path.
+- Special focus on loops aggregating per-element stats: if continuing computation when P is NULL (e.g., updating totals) but still accessing fields of P later, require an early continue or a full if-guard covering all uses of P.
+
+Heuristics/indicators:
+- Pattern: P = READ_ONCE(A[i]); if (P) do_something(P); aggregate += ...; use P->field;
+- Any dereference of P must be post-dominated by a NULL check on P within the same loop iteration. If not, report.
+
+Fix pattern:
+- Convert partial guard to an early continue on NULL, or wrap all subsequent uses of P in the same if (!NULL) block.
+
+Bug pattern: Using PCI device ID table’s driver_data without NULL check in probe()
+
+- Context: In many Linux drivers, probe() retrieves per-device metadata via id->driver_data from the PCI/USB/etc. ID table and immediately dereferences it.
+- Fault: Some ID table entries set driver_data to NULL (either intentionally for generic handling or by omission). Probe code assumes it’s always non-NULL and dereferences fields from it, causing a null-pointer dereference during device initialization.
+- Manifestation in patch: com20020pci_probe() cast id->driver_data to struct com20020_pci_card_info * (ci) and used ci->misc_map without verifying ci != NULL.
+- Fix: Check id->driver_data for NULL and fail probe with an error (e.g., -EINVAL) before dereferencing.
+
+Reusable detection rule for static analyzers:
+- In driver probe functions (e.g., foo_probe(struct pci_dev *, const struct pci_device_id *id)):
+  - Identify assignments of a pointer from id->driver_data (or similar bus match data such as of_device_get_match_data(), usb_device_id::driver_info).
+  - If the pointer is dereferenced without a preceding NULL check and the corresponding ID/match tables contain entries where this field can be NULL (or default-initialized), flag as a potential null-pointer dereference.
+- Heuristics:
+  - Track flows from id->driver_data (or of_match_device(...)->data, device_get_match_data(), acpi_device_get_match_data(), platform_device_id::driver_data) to dereferences.
+  - Require a dominating non-NULL check before first dereference.
+  - Optionally confirm risk by inspecting the match table to see if any entry initializes the data/driver_data to 0/NULL or leaves it unspecified.
+
+Bug pattern: Unconditional use of an optional/conditionally-attached property without verifying it is present, leading to NULL dereference.
+
+Details:
+- In DRM connectors, certain properties (e.g., vrr_capable_property) are not attached by default; they are only created/attached if the hardware/driver supports the feature.
+- The code called drm_object_property_set_value(connector->vrr_capable_property, ...) without first checking that connector->vrr_capable_property was non-NULL.
+- When the property wasn’t attached, this resulted in a NULL dereference inside the DRM core set-property path.
+
+Actionable checker rule:
+- For any code that sets or accesses a DRM object property pointer (e.g., connector->X_property, crtc->X_property, plane->X_property), verify that the property field is non-NULL before use.
+- Flag calls to drm_object_property_set_value, drm_atomic_set_*, or similar property manipulation functions where the property argument originates from a struct field that can be conditionally attached (commonly named *_property) and is not proven non-NULL.
+- Similarly, in subsystems with optional feature properties, require a guard: if (!obj->prop) return; or handle absence gracefully before dereferencing or passing to APIs that expect a valid property.
+
+Heuristic indicators:
+- Struct fields named vrr_capable_property, hdr_output_metadata_property, max_bpc_property, scaling_mode_property, etc.
+- Properties that are documented/attached only when capability flags are true.
+- Setter functions invoked during init/probing or hotplug paths where capability detection may disable property attachment.
+
+Bug pattern: Misinterpreting optional gpiod_get_optional() results and using NULL as a valid GPIO descriptor
+
+- Context: gpiod_get_optional() returns:
+  - NULL when the GPIO is not specified (optional and absent)
+  - ERR_PTR(...) on failure
+  - valid pointer on success
+
+- Faulty pattern:
+  - Code checks only IS_ERR(desc) and then proceeds to use the descriptor when it is NULL, e.g., converting a NULL GPIO descriptor to an IRQ (gpiod_to_irq(NULL)), causing failure and propagating an error that prevents driver registration.
+
+- Correct handling pattern:
+  - If desc == NULL: treat as “optional and not present” and return success or skip setup.
+  - Else if IS_ERR(desc): handle and return the error.
+  - Else: proceed with using the GPIO.
+
+- Static checker rule:
+  - For any call to gpiod_get_optional()/devm_gpiod_get_optional():
+    - Flag paths where the returned pointer is used (dereferenced, passed to functions like gpiod_to_irq, gpiod_direction_*, gpiod_set_*, etc.) without first checking for NULL.
+    - Flag code that only checks IS_ERR() but not NULL before use.
+    - Conversely, ensure code distinguishes NULL from ERR_PTR and does not treat NULL as an error that should abort unless explicitly intended.
+
+Bug pattern: Dereferencing a potentially NULL pointer before a NULL check by using its fields to initialize a local variable.
+
+Details:
+- Code computed len = skb->len before checking if (skb) is NULL.
+- If skb is NULL, this access dereferences a NULL pointer, causing a crash.
+- Fix: Move any access to fields of a pointer (e.g., skb->len) to after the explicit NULL check.
+
+Reusable checker idea:
+- For any pointer variable p that is later checked (if (!p) or similar), flag any dereference (p->field, *p, function calls using p as dereferenced) that occurs before the NULL check within the same control flow path (especially in the same function scope before the first dominating NULL guard).
+- Special case initialization: flag assignments of the form T x = p->field where p is only checked for NULL afterward.
+
+This pattern commonly appears when refactoring code to add NULL checks but leaving earlier dereferences intact.
+
+Bug pattern: Missing NULL-check after ioremap (or similar MMIO mapping) and continuing to use the returned pointer.
+
+- Context: Functions like ioremap() can fail and return NULL. The code assigned the result to a global/field (par_io) and proceeded to use it without verifying success.
+- Consequence: Dereferencing a NULL MMIO pointer leading to NULL-pointer dereference, undefined behavior, or silent failures during hardware register access.
+- Detection rule for a checker:
+  - Identify calls to ioremap/ioremap_np/ioremap_wc/devm_ioremap* (and similar mapping APIs) whose return type is a pointer.
+  - If the returned value is stored (local/global/struct field) and subsequently used (dereferenced, passed to readl/writel, memcpy_toio, etc.) without an intervening NULL check guarding all uses, report an error.
+  - Also flag if the function fails to propagate an error when the mapping failed (e.g., not returning an error code or not handling cleanup).
+
+- Fix pattern: Immediately check the result of ioremap; on NULL, return an appropriate error (e.g., -ENOMEM) and avoid any further use.
+
+Bug pattern: Missing NULL-check after managed memory allocation before dereferencing
+
+- Context: devm_kmalloc() can return NULL on allocation failure.
+- Fault: The code allocates lp->indirect_lock with devm_kmalloc() and immediately uses it (spin_lock_init(lp->indirect_lock)) without verifying the pointer is non-NULL.
+- Consequence: Potential NULL pointer dereference if allocation fails.
+- Detection rule for a static analyzer:
+  - Identify calls to allocation functions that may return NULL (e.g., kmalloc, kzalloc, devm_kmalloc, devm_kzalloc, etc.).
+  - If the returned pointer is subsequently dereferenced, passed to functions expecting a valid object, or used to initialize synchronization primitives without an intervening NULL check, report an error.
+  - Scope the check within the same function/control-flow path; ensure any check (if (ptr == NULL) return/handle) dominates all uses.
+
+- Remediation pattern: After devm_kmalloc (or similar), check if the returned pointer is NULL and handle (e.g., return -ENOMEM) before any use.

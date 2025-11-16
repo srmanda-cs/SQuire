@@ -1,0 +1,229 @@
+Plan for a Clang Static Analyzer (CSA) checker: “Require dominating non-NULL guard before first use of possibly-NULL/optional pointers”
+
+1) Core logic to capture
+- Goal: For any pointer that may be absent/NULL or be an ERR_PTR from designated sources, ensure the first use is dominated by a check establishing non-NULL (and non-ERR when applicable) along all paths.
+- Sources to taint as PossiblyNull:
+  - Memory allocators/mappers: kmalloc/kzalloc/kmalloc_array/kcalloc/kvmalloc/vmalloc/vzalloc/devm_kmalloc/devm_kzalloc/ioremap/devm_ioremap and variants.
+  - Device/bus match data: id->driver_data, platform_device_id::driver_data, usb_device_id::driver_info, of_/acpi_/device_get_match_data, etc.
+  - Optional-get APIs: gpiod_get_optional/devm_gpiod_get_optional, DRM *_property fetches, other “optional get” functions documented to return NULL when absent and ERR_PTR on error.
+  - Any pointer later explicitly NULL-checked (heuristic: if code checks p == NULL at any point, mark p as PossiblyNull from its last assignment).
+- Uses that require non-NULL:
+  - Dereference and derived: *p, p->f, p[i], pointer arithmetic used for access.
+  - Passing to known APIs that require valid pointer or MMIO object (e.g., memcpy, memset, readl/writel families, drm property setters, gpiod_to_irq, init APIs taking pointer).
+  - Interprocedural conservative rule: passing to unknown functions is treated as a use unless modeled otherwise.
+- Dominance requirement:
+  - The first use after a tainting assignment must be control-dominated by a guard that proves p != NULL (and not ERR_PTR when relevant), covering all paths to the use in the current exploded graph state.
+  - In loops, each iteration must be guarded; partial guards are violations.
+- Specialized tri-state for optional-get APIs:
+  - Values: ERR_PTR(e), NULL (absent), valid pointer.
+  - Require explicit handling: if (IS_ERR(p)) … else if (!p) … else … before use; only checking IS_ERR then using p is a violation.
+
+2) Program states and data structures to maintain
+- Per-symbol metadata map: RegionState: MemRegion -> PointerState
+  - PointerState fields:
+    - SourceKind: {Allocator, Mapper, MatchData, OptionalGet, LaterChecked, Unknown}
+    - TriStateMode: {None, ErrOrNullOrValid} (for IS_ERR/optional APIs)
+    - CheckedStatus: bitmask
+      - CheckedForNull: bool (known true in current path)
+      - CheckedNotErr: bool (known true in current path)
+    - FirstAssignmentStmt: ProgramPoint (for diagnostics location)
+    - FirstUseReported: bool (avoid duplicate reports)
+    - LastValueSVal (optional, for debugging/notes)
+- For path-sensitive guard reasoning:
+  - A refinement lattice over each pointer symbol:
+    - ValueClass: {Unknown, DefinitelyNull, DefinitelyErrPtr, DefinitelyNonNullNonErr}
+  - We derive ValueClass via branch conditions and model calls like IS_ERR, IS_ERR_OR_NULL, if (p), if (!p), comparisons with NULL.
+- Auxiliary:
+  - KnownFunctionSet with semantics:
+    - TaintSources: function name -> {SourceKind, TriStateMode?}
+    - NonNullRequiredParams: function name -> set<int> indices
+    - GuardFunctions: e.g., IS_ERR, IS_ERR_OR_NULL, IS_REACHABLE? -> evaluation semantics
+  - Expr-to-Region mapping: use getMemRegionFromExpr().
+  - Region equivalence tracking: when pointers are assigned/propagated p = q, transfer PointerState to new region symbol.
+  - Loop context info (optional): minimal approach uses path-sensitive guard states; we don’t need full loop post-dominance if we rely on ExplodedGraph states.
+
+3) Callback functions and purposes
+- checkPostCall
+  - Identify source functions that can return NULL/ERR_PTR and taint the return value’s region with PointerState(SourceKind=..., TriStateMode if applicable).
+  - Identify calls that require non-NULL parameters; treat argument evaluation as a “use” site.
+  - Model guard-return helpers: IS_ERR(x), IS_ERR_OR_NULL(x), PTR_ERR_OR_ZERO, etc., by binding path predicates to ValueClass updates when their results are used in conditions.
+- checkBind
+  - When a value is assigned/bound to a variable/field, propagate PointerState from RHS region/symbol to LHS’s region.
+  - When binding NULL/ERR_PTR constant to a region, update ValueClass accordingly.
+  - When p is re-assigned, reset its PointerState per new RHS; clear CheckedStatus and FirstUseReported.
+- checkBranchCondition
+  - Interpret conditional expressions to update ValueClass and CheckedStatus on the true/false successor states:
+    - if (p): true branch -> CheckedForNull=true; ValueClass=DefinitelyNonNullNonErr (unless TriStateMode requires NotErr check), false branch -> DefinitelyNull.
+    - if (!p) or p == NULL: true -> DefinitelyNull; false -> CheckedForNull=true.
+    - if (IS_ERR(p)): true -> DefinitelyErrPtr; false -> CheckedNotErr=true.
+    - if (IS_ERR_OR_NULL(p)): true -> PossiblyNullOrErr (we can split: either null or err); false -> CheckedForNull=true and CheckedNotErr=true.
+    - if (PTR_ERR_OR_ZERO(p)): doesn’t directly prove non-NULL; treat only when combined with IS_ERR logic if recognizable.
+- checkLocation
+  - Detect memory reads/writes via pointer dereference, structure/array access, pointer arithmetic used for access. For the base pointer region involved, treat as a “use.”
+- checkPostStmt for ArraySubscriptExpr/MemberExpr/UnaryDeref/UnaryOperator(‘*’) and for CallExpr arguments
+  - Alternative to checkLocation: directly catch AST-level uses and map to regions.
+- checkPreCall
+  - Before calling a function, check each argument that maps to a region tracked as PossiblyNull; if callee requires non-NULL for that parameter (from NonNullRequiredParams or default conservative rule), treat as a use requiring dominance.
+- checkEndFunction / checkDeadSymbols
+  - Cleanup PointerState entries; prune to avoid leaks.
+- checkPostStmt(DeclStmt/VarDecl)
+  - On initialization from a tainted source or from a pointer field known optional (name heuristics: ExprHasName("*_property") etc.), tag the variable’s region.
+
+4) Sequence of steps to mark, validate, or report a violation
+A) Taint introduction
+- In checkPostCall:
+  - If call to a known source function S:
+    - Obtain return region R via getMemRegionFromExpr(callExpr).
+    - Create PointerState with:
+      - SourceKind based on S, TriStateMode = ErrOrNullOrValid for optional-get or IS_ERR-capable APIs, else None.
+      - CheckedStatus = {false,false}, FirstAssignmentStmt = current ProgramPoint.
+    - Store in State map: RegionState[R] = PointerState.
+- In checkBind:
+  - If RHS is a call result already tainted or a field known as match-data or *_property by name, taint LHS region similarly.
+  - If RHS is NULL: mark ValueClass=DefinitelyNull for LHS region.
+  - If RHS is taken from a symbol with PointerState, copy PointerState to LHS; maintain alias tracking as needed.
+
+B) Guard recognition and propagation
+- In checkBranchCondition:
+  - Identify guards that reference tracked regions:
+    - p, p != NULL, p == NULL, !p, IS_ERR(p), IS_ERR_OR_NULL(p).
+  - For the true/false successor states, update:
+    - ValueClass and CheckedStatus flags.
+  - Example: After if (p) { … } we set CheckedForNull=true for that region on the taken branch; after else branch, DefinitelyNull.
+
+C) Use-site detection
+- In checkLocation and checkPostStmt(AST use):
+  - On dereference/MemberExpr/ArraySubscriptExpr/UnaryDeref/Pointer arithmetic used as base for memory access:
+    - Base region RB = getMemRegionFromExpr(baseExpr).
+    - If RB has PointerState and FirstUseReported=false:
+      - Validate dominance: Is current path state proving RB is non-null (and non-ERR when TriStateMode applies)?
+        - Condition: ValueClass == DefinitelyNonNullNonErr, or CheckedForNull=true and (TriStateMode==None or CheckedNotErr=true).
+      - If not proven:
+        - Report violation via reportUncheckedDereference(node, RB, FirstAssignmentStmt, sourceKind, useKind).
+        - Mark FirstUseReported=true (to suppress duplicates for this path/use).
+- In checkPreCall:
+  - For each argument Ai with region RA and PointerState:
+    - If callee is known to require non-NULL for parameter i or we apply conservative rule that pointers passed by value are uses unless explicitly nullable:
+      - Apply same validation as above; if not proven non-NULL/non-ERR, report.
+  - Special-case len=0 APIs? Optional: skip if model says argument can be NULL when length is zero; this requires API modeling.
+
+D) Optional-get tri-state enforcement
+- In checkPreCall/checkLocation:
+  - For TriStateMode pointers, require both CheckedNotErr and CheckedForNull before use.
+  - Patterns to accept:
+    - if (IS_ERR(p)) return err; if (!p) return 0; … use p …
+    - if (IS_ERR_OR_NULL(p)) … handle … else … use p …
+  - Anti-pattern:
+    - if (IS_ERR(p)) return err; … use p … without null-check => report.
+- In branch modeling, IS_ERR_OR_NULL(p) false branch sets both flags true.
+
+E) Dominance across loops and partial guards
+- Rely on path-sensitive state:
+  - Each use is evaluated in its current path with the guard flags. If some paths reach the use with flags unset, CSA will produce a bug report along those paths; if all paths have guards, no bug.
+- Partial guard detection:
+  - If in a loop body there is a use of p before any guard in the path to that use, it will be reported for those paths (e.g., iterations where guard is skipped).
+- Early-continue/return modeling:
+  - If code has if (!p) continue; then for paths reaching later uses in the same iteration, p is known non-NULL; this is captured by CheckedForNull set on the fall-through path and the branch that continues prunes the violating path.
+
+F) “Later-checked” heuristic
+- In checkBranchCondition:
+  - If we observe a comparison p == NULL or p != NULL for a region that currently has no SourceKind but is pointer-typed, retroactively mark it as PossiblyNull with SourceKind=LaterChecked (unless already known non-null). This enables flagging prior dereferences before the first dominating check.
+- In use detection:
+  - If a dereference occurs before any guard has proven non-NULL (CheckedForNull=false) and the pointer is marked LaterChecked due to later comparisons elsewhere on the path/function, report.
+
+G) Reducing false positives
+- Recognize nofail patterns (heuristic):
+  - If allocator call includes GFP flag known to be NOFAIL and we can parse it, clear taint. Otherwise, default to taint.
+- Recognize ASSERT-like macros:
+  - If BUG_ON(!p) or WARN_ON(!p) precedes use, treat as a guard (BUG_ON dominates via abort); model as CheckedForNull on the non-crash path.
+- Respect intrinsics like nonnull attributes:
+  - If a function parameter is annotated nonnull, do not taint that parameter in this checker.
+- Reassignments:
+  - If p is reassigned to a known valid address (taking address of object &obj), clear taint.
+- Null-check via switch/case patterns:
+  - Limited: if we see switch (!!p) or ternary guards, map them similarly in checkBranchCondition or checkPostStmt(ConditionalOperator).
+
+H) Diagnostic content
+- reportUncheckedDereference should include:
+  - Pointer name (from ExprHasName if available), source location of first assignment and of the use, and short reason:
+    - “Pointer from ‘kmalloc’ may be NULL; first use is not dominated by a non-NULL check.”
+    - “Optional pointer from gpiod_get_optional requires NULL and ERR checks before use; found use without NULL check.”
+    - “Pointer later NULL-checked is dereferenced before the check.”
+- Provide fix hints:
+  - Insert early guard after assignment: if (!p) return -ENOMEM; or IS_ERR/NULL tri-state handling.
+
+Implementation details per callback
+- checkPostCall(CallEvent CE, CheckerContext C)
+  - If CE.getCalleeIdentifier() in TaintSources:
+    - Region R = getMemRegionFromExpr(CE.getOriginExpr())
+    - Create PointerState with SourceKind and TriStateMode.
+    - State = State.set(R, PointerState)
+    - C.addTransition(State)
+  - For guard functions, record symbolic eval info in ProgramState as needed (e.g., map SymExpr -> GuardKind) to help branch modeling.
+- checkBind(SVal location, SVal val, SVal origin, CheckerContext C)
+  - If val refers to a region RS that has PointerState, set that state on destination region RD; clear FirstUseReported.
+  - If val is zero/null SVal: set ValueClass=DefinitelyNull for RD.
+  - If val is from &obj: clear taint on RD.
+- checkBranchCondition(IfStmt/WhileStmt/DoStmt/ForStmt condition, CheckerContext C)
+  - Extract base expressions and model:
+    - p, !p, p == NULL, p != NULL.
+    - CallExpr to IS_ERR, IS_ERR_OR_NULL.
+  - Use assume() on symbolic values to distinguish T/F states; update CheckedStatus and ValueClass in successor states.
+- checkLocation(SVal l, bool isLoad, const Stmt* S, CheckerContext C)
+  - If l is a MemRegionVal or derived from a pointer region RB with PointerState:
+    - Validate as “use.” If violation, emit reportUncheckedDereference.
+- checkPostStmt(MemberExpr/ArraySubscriptExpr/UnaryOperator('*')/BinaryOperator with pointer arithmetic)
+  - Extract base region; delegate to same validation logic as in checkLocation.
+- checkPreCall
+  - For each argument Ai:
+    - RA = getMemRegionFromExpr(Ai)
+    - If RA has PointerState and callee requires non-NULL for this param (from NonNullRequiredParams or default rule), validate and report if unproven.
+- checkDeadSymbols
+  - Remove PointerState entries for dead regions; reset temporary ValueClass.
+
+Known function modeling (seed sets)
+- TaintSources:
+  - {"kmalloc","kzalloc","kmalloc_array","kcalloc","kvmalloc","vmalloc","vzalloc","devm_kmalloc","devm_kzalloc","ioremap","devm_ioremap", "...variants"}
+  - {"gpiod_get_optional","devm_gpiod_get_optional"} -> TriStateMode
+  - {"of_device_get_match_data","acpi_device_get_match_data","device_get_match_data"} -> SourceKind=MatchData
+- GuardFunctions:
+  - {"IS_ERR","PTR_ERR","ERR_PTR","IS_ERR_OR_NULL"}
+- NonNullRequiredParams:
+  - {"memcpy","memset","memmove"} -> {0,1} as applicable
+  - {"readl","writel","drm_object_property_set_value","gpiod_to_irq"} -> param indices that must be valid
+  - Extendable via a JSON or table and attributes like __must_check or __nonnull when available.
+- Name heuristics:
+  - ExprHasName("*_property") -> mark as OptionalGet semantics when assigned.
+
+Validation rules summary
+- A use is safe if:
+  - ValueClass == DefinitelyNonNullNonErr; or
+  - CheckedForNull == true AND (TriStateMode==None OR CheckedNotErr==true)
+- Otherwise, report.
+
+Examples flagged
+- p = kmalloc(...); p->field = ...; // no check -> report
+- p = gpiod_get_optional(...); if (IS_ERR(p)) return PTR_ERR(p); do_something(p); // missing NULL check -> report
+- foo = p->x; if (!p) return; // deref before dominating check -> report
+- if (p) use1(p); use2(p); // if use2 is outside the if, report for use2.
+
+Examples accepted
+- p = kmalloc(...); if (!p) return -ENOMEM; p->field = ...;
+- p = gpiod_get_optional(...); if (IS_ERR(p)) return err; if (!p) return 0; use(p);
+- if (!p) continue; // in loop; later deref in same iteration is safe.
+
+Testing strategy
+- Unit tests per source kind and per guard pattern.
+- Tri-state tests for optional-get APIs with each of: ERR_PTR, NULL, valid.
+- Loop partial-guard tests.
+- Match-data fields with possibly zero driver_data entries.
+
+Performance considerations
+- Minimize interprocedural overhead: model only selected known APIs for NonNullRequiredParams.
+- Use on-demand state map keyed by MemRegion and prune in checkDeadSymbols.
+- Avoid reporting duplicates by FirstUseReported flag and by uniqueing BugReports per path.
+
+Extensibility
+- Add new sources and non-NULL-requiring APIs via a central registry.
+- Optionally integrate dominance/post-dominance data from the AST/CFG to augment path reasoning if needed.
+- Add annotations to suppress or assert non-NULL via comments/pragmas if desired.

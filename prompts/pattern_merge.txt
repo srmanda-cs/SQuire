@@ -1,0 +1,10 @@
+# Instruction
+The following are multiple bug patterns that correspond to the same general defect family.
+Merge them into a single, precise, and generalizable rule that can guide
+a static analysis checker design.
+
+Be specific enough to capture the core root cause, but general enough
+to apply across similar contexts.
+
+# Bug Patterns
+{{BUG_PATTERNS}}
