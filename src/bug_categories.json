@@ -1,6 +1,6 @@
 [
   "Null-Pointer Dereference (NPD)",
-  "Use-Before-Intialization (UBI)",
+  "Use-Before-Initialization (UBI)",
   "Integer Overflow",
   "Out-of-Bounds (OOB)",
   "Buffer Overflow",
