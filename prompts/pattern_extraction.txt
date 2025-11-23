@@ -1,0 +1,13 @@
+# Instruction
+You will be provided with a patch in the Linux kernel.
+Please analyze the patch and find the **bug pattern** fixed in this patch.
+
+A **bug pattern** is the root cause of the bug, meaning that
+programs exhibiting this pattern have a high probability of
+showing the same defect.
+
+Make the pattern specific, accurate, and reusable so that it could
+drive a static analyzer or checker to detect similar issues.
+
+# Target Patch
+{{DIFF_AND_MESSAGE}}

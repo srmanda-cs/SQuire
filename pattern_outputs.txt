@@ -1,0 +1,413 @@
+**Bug pattern (root cause):**
+
+Inside a loop over an array of pointers, the code partially guards a pointer dereference with a NULL check, but then dereferences the same pointer later in the same loop body without re-checking or early‑continuing. When the pointer is NULL, the first use is skipped, but a subsequent unguarded use still occurs, causing a potential NULL pointer dereference.
+
+**In this specific patch:**
+
+
+for (i = 0; i < vsi->num_txq; i++) {
+    u64 pkts = 0, bytes = 0;
+
+    ring = READ_ONCE(rings[i]);
+    if (ring)
+        ice_fetch_u64_stats_per_ring(&ring->syncp, ring->stats, &pkts, &bytes);
+    vsi_stats->tx_packets += pkts;
+    vsi_stats->tx_bytes += bytes;
+    vsi->tx_restart += ring->tx_stats.restart_q;  // <-- unguarded deref of ring
+}
+
+
+`ring` is NULL-checked only around `ice_fetch_u64_stats_per_ring()`, but `ring->tx_stats.restart_q` is always accessed even when `ring` is NULL.
+
+The fix converts the pattern to an early `continue`:
+
+
+ring = READ_ONCE(rings[i]);
+if (!ring)
+    continue;   // ensures no later dereference when ring is NULL
+
+ice_fetch_u64_stats_per_ring(&ring->syncp, ring->stats, &pkts, &bytes);
+...
+vsi->tx_restart += ring->tx_stats.restart_q;
+
+
+**Generalizable bug pattern suitable for a checker:**
+
+> **Pattern**: Within a loop (or block) that processes an array or list of pointers:
+> - A pointer `p` is assigned from a container (e.g., `p = A[i]`).
+> - A conditional `if (p)` (or `if (p != NULL)`) guards some uses of `p`.
+> - One or more other uses of `p` (e.g., `p->field`, `p->method(...)`) occur later in the same lexical scope (same iteration) outside the guarded region, without an unconditional path that guarantees `p` is non‑NULL (such as `continue`, `break`, or `return` in the `else` branch).
+
+**Heuristic for static analysis:**
+
+1. Find assignments of the form `p = ...` where `...` may be NULL (e.g., reading from an array of pointers, list nodes, etc.).
+2. In the same basic block or loop iteration, detect:
+   - A condition `if (p)` / `if (!p)` or equivalent nullness check.
+   - At least one dereference of `p` (member access, function call via pointer) inside the guarded block.
+   - At least one dereference of `p` *outside* all branches that guarantee `p` is non‑NULL, and without an unconditional exit/continue on the `p == NULL` path.
+3. If the NULL branch can reach the unguarded dereference, report a potential NULL pointer dereference.
+
+This pattern focuses on *incomplete guarding*: some uses of a possibly-NULL pointer are protected, giving the false impression that all uses are safe, while later unguarded uses remain vulnerable.
+
+**Bug pattern:** Mismatched NULL-check after dynamic allocation
+
+**Core idea**
+
+After a dynamic allocation (`malloc/calloc/realloc/...`) the code checks the wrong pointer variable for `NULL`, leaving the actually allocated pointer unchecked (and potentially `NULL`), which can later be dereferenced and cause a crash.
+
+---
+
+**Abstract pattern**
+
+In C code:
+
+
+T *p = alloc_fn(...);  // malloc/calloc/realloc/posix_memalign/etc.
+if (!q) {              // q is a different pointer from p
+    // error handling
+}
+use(*p);               // p is used assuming allocation succeeded
+
+
+Conditions:
+
+1. `alloc_fn` returns a pointer value assigned (directly or indirectly) to variable `p`.
+2. Immediately after the allocation, a pointer variable `q` is checked against `NULL`.
+3. `q` is not the same variable as `p` (and not an alias pointing to the same location).
+4. The variable `p` is subsequently dereferenced or otherwise used as if allocation succeeded.
+5. There is no intervening check that guarantees `p` is non-NULL.
+
+In the concrete patch:
+
+
+epollfdp = calloc(nested, sizeof(int));
+if (!epollfd)       // BUG: checking epollfd instead of epollfdp
+    err(EXIT_FAILURE, "calloc");
+
+
+The fix:
+
+
+epollfdp = calloc(nested, sizeof(int));
+if (!epollfdp)      // Correct: check the result of calloc
+    err(EXIT_FAILURE, "calloc");
+
+
+---
+
+**Checker heuristic**
+
+A static analyzer can look for:
+
+1. A call to an allocation function whose return value is stored in pointer variable `p`.
+2. Within a small instruction/window range after that, a NULL-check on some pointer `q`.
+3. If `q` ≠ `p` and there is no other explicit reason to check `q` (e.g., `q` wasn’t modified or assigned from that allocation), raise a warning:
+
+> "Result of allocation stored in `p` is never NULL-checked; instead `q` is checked. Possible wrong variable in NULL check."
+
+This pattern generalizes to other resource-returning functions (e.g., `fopen`, `socket`) where a different handle variable is mistakenly checked instead of the newly returned one.
+
+**Bug pattern: Wrong-variable NULL check after allocation**
+
+**Context**
+
+In a loop, the code allocates memory and stores the result in one variable, but then checks a *different* variable for NULL to detect allocation failure:
+
+
+tmp->symbol = strdup(symbols[i].symbol);
+if (!list->symbol)   // BUG: checks wrong pointer
+    goto err_free;
+
+
+Correct code:
+
+
+tmp->symbol = strdup(symbols[i].symbol);
+if (!tmp->symbol)    // Check the just-assigned pointer
+    goto err_free;
+
+
+---
+
+### Generalized bug pattern
+
+**Pattern description**
+
+After a function call that may return NULL (e.g., `malloc`, `strdup`, `calloc`, `realloc`, etc.) and whose result is assigned to a pointer `P`, the subsequent NULL check is performed on a *different* pointer `Q` that:
+
+- is not syntactically identical to `P`, and  
+- was not modified by the call, and  
+- is used as if it had been checked for allocation failure.
+
+This yields a false sense of safety: allocation failure for `P` is not detected, and `P` may later be dereferenced while NULL.
+
+---
+
+### Formalized for a static checker
+
+Look for:
+
+1. **Allocation-like call**  
+   A function `F` known or annotated as possibly returning NULL (e.g., memory/string allocators), used in an assignment:
+
+   ```c
+   X = F(...);
+   
+
+   where `X` is a pointer-typed lvalue (e.g., `tmp->symbol`).
+
+2. **Immediate NULL check on a different expression**  
+   Within a small syntactic/window proximity (same basic block, nearby statements), a NULL check:
+
+   ```c
+   if (!Y)        // or Y == NULL, NULL == Y
+       ...
+   
+
+   where `Y` is a pointer expression and `Y` is **not** equivalent to `X` (different variable, member, or base pointer).
+
+3. **Unchecked use of allocated pointer**  
+   After this misdirected check, `X` is used in a way that assumes non-NULL (dereference, passed to functions expecting valid memory, etc.) without any proper check on `X`.
+
+4. **No correct check on X in between**  
+   There is no intervening condition that actually checks `X` for NULL before its unsafe use.
+
+---
+
+### Heuristics to reduce false positives
+
+- Allow field/array indexing changes only if they are syntactically the same expression (e.g., ignore `*(tmp->symbol)` vs `tmp->symbol`).
+- Flag when `Y` is:
+  - A different struct field (`list->symbol` vs `tmp->symbol`),
+  - A different base pointer (`list->symbol` vs `tmp->symbol`),
+  - A different variable entirely (`p` vs `q`).
+- Prefer cases where the condition leads to error-handling paths (e.g., `goto err`, `return -ENOMEM;`), indicating intended allocation failure handling.
+
+---
+
+### Essence of the bug pattern
+
+> After assigning the result of a potentially NULL-returning function to a pointer, the code checks NULL on some *other* pointer instead of the one that just received the result.
+
+**Bug pattern:**  
+Dereferencing a per‑device metadata pointer obtained from `struct pci_device_id::driver_data` (or similar driver‑data fields) without checking for NULL, even though some entries in the device ID table intentionally leave that field empty (set to NULL).
+
+**Context in this patch:**  
+- In `com20020pci_probe()`:
+  ```c
+  ci = (struct com20020_pci_card_info *)id->driver_data;
+  priv->ci = ci;
+  mm = &ci->misc_map;      // dereference
+  
+- But the `com20020pci_id_table` defines some devices with `driver_data = NULL`.
+- When such a device is probed, `ci` is NULL and `mm = &ci->misc_map` dereferences a NULL pointer → null‑ptr‑deref.
+
+**Abstracted bug pattern (for a checker):**
+
+1. A probe/attach/init function receives a device ID object (e.g., `struct pci_device_id *id`, `struct usb_device_id *id`, etc.).
+2. It reads a pointer from a generic “driver data” field (or equivalent) in that ID:
+   - `id->driver_data` cast to some struct type.
+3. It immediately dereferences a field of that pointer (or otherwise uses it as a valid object) without:
+   - checking `pointer != NULL`, and
+   - ensuring (e.g., via table definition) that all ID table entries set this field to a non‑NULL value.
+4. At least one entry in the corresponding ID table initializes that driver‑data field to NULL (or leaves it default‑zeroed).
+
+**Reusable rule for static analysis:**
+
+- Identify functions that:
+  - Take a `const struct <bus>_device_id *id` parameter (PCI/USB/OF/etc.), and
+  - Assign `T *p = (T *)id->driver_data;` (or similar) to a local pointer.
+- Flag a warning if:
+  - `p` is dereferenced (any `p->field`, `*p`, `memcpy(p, …)`, passing as non‑nullable parameter, etc.),
+  - AND there is no preceding control‑flow‑dominant check that `p` is non‑NULL (e.g., `if (!p) return …;`),
+  - AND in the corresponding `static const struct <bus>_device_id …[]`:
+    - at least one entry has `.driver_data = NULL` or omits `.driver_data` so it’s zero‑initialized.
+
+This pattern generalizes to any driver framework where:
+
+- A runtime function consumes per‑ID metadata from a compile‑time table,
+- The metadata pointer is optional (may be NULL),
+- But the runtime code assumes it is always present and dereferences it unconditionally.
+
+**Bug pattern:**  
+Missing NULL-check after `ioremap()` (or similar mapping/allocation APIs), leading to use of a potentially invalid pointer.
+
+---
+
+### Pattern in this patch
+
+In `par_io_init()`:
+
+
+par_io = ioremap(res.start, resource_size(&res));
+/* previously: no check here, code would use par_io blindly */
+if (!par_io)
+    return -ENOMEM;
+
+
+Before the patch, the code:
+
+1. Called `ioremap(res.start, resource_size(&res));`
+2. Assumed the return value (`par_io`) is always non-NULL.
+3. Continued initialization and later dereferenced `par_io`.
+
+But `ioremap()` can fail and return `NULL`. Using this pointer without checking would cause NULL pointer dereferences or other undefined behavior.
+
+---
+
+### Generalized bug pattern (for a static checker)
+
+**Context:**  
+Any function that acquires a pointer from a kernel API that can fail and return `NULL`, such as:
+- `ioremap()`, `ioremap_nocache()`, `devm_ioremap*()`
+- memory allocators that return `NULL` on failure (when not using `ERR_PTR`)
+- similar mapping or resource acquisition functions
+
+**Bug pattern definition:**
+
+> A function calls a mapping/allocation API that can return `NULL` on failure (e.g., `ioremap()`), assigns the result to a pointer variable `p`, and there exists a control-flow path where `p` is dereferenced or otherwise used without an intervening check that `p != NULL`.
+
+More formally:
+
+- Let `p = ioremap(addr, size);`
+- There is no check of the form `if (!p)`, `if (p == NULL)`, or `IS_ERR_OR_NULL(p)` (depending on API semantics) on all paths before:
+  - `*p`, `p->field`, `memcpy_toio(p, ...)`, `readl(p)`, `writel(..., p)`, or any other dereference/use of `p`.
+
+The checker should:
+
+1. Recognize APIs whose contract includes "return NULL on failure" (e.g., `ioremap()`).
+2. Track the returned pointer.
+3. Flag a warning/error if the pointer is used (dereferenced, passed to APIs expecting valid mapped memory) without first being validated against `NULL` on all control-flow paths.
+
+---
+
+### Distinguishing features
+
+- The return value is **not** an `ERR_PTR()`, but a plain pointer where failure is indicated by `NULL`.
+- The bug resides in **the caller function** that fails to validate the return before use.
+- The risk is especially high in **initialization/setup paths** where the pointer is stored globally or used to configure hardware (like `par_io` here).
+
+This pattern is reusable to detect similar issues across the kernel where `ioremap()` (or equivalent NULL-on-failure APIs) is used without mandatory NULL checking.
+
+**Bug pattern:**  
+Use of an unchecked `devm_kmalloc()` return value (potential NULL dereference) when allocating synchronization primitives (or other objects), immediately followed by dereference/initialization.
+
+**More precise description**
+
+In `temac_probe()`:
+
+
+lp->indirect_lock = devm_kmalloc(&pdev->dev,
+				 sizeof(*lp->indirect_lock),
+				 GFP_KERNEL);
+spin_lock_init(lp->indirect_lock);
+
+
+`devm_kmalloc()` can return `NULL` on allocation failure. The code did not check this return value and immediately passed `lp->indirect_lock` to `spin_lock_init()`, which will dereference it. This leads to a potential NULL pointer dereference if allocation fails.
+
+**Generalizable bug pattern**
+
+- API: `devm_kmalloc()` (and similar managed allocators, e.g. `devm_kzalloc()`)
+- Behavior: may return `NULL` on failure.
+- Misuse pattern:
+  1. Call `devm_kmalloc()` (or similar) and store the result in a pointer `p`.
+  2. Do not check `p` for `NULL`.
+  3. Immediately dereference or pass `p` to a function that dereferences it (e.g., `spin_lock_init()`, `mutex_init()`, `memcpy()`, structure field access, etc.).
+
+**Checker rule sketch**
+
+Flag code where:
+
+1. A function known to return `NULL` on allocation failure (e.g. `devm_kmalloc`, `devm_kzalloc`, `kmalloc`, `kzalloc`, etc.) is called, and the return value is stored in a pointer `p`.
+2. There is no intervening `if (!p)` or equivalent NULL check along all paths before `p` is dereferenced or passed to a function that may dereference it.
+3. Especially prioritize cases where the pointer is used in:
+   - initialization of kernel synchronization primitives (`spin_lock_init(p)`, `mutex_init(p)`, `init_completion(p)`, etc.).
+   - any function known (via models) to dereference its pointer argument.
+
+This pattern drives a static analyzer to detect unchecked allocation-returned pointers that are immediately used, preventing NULL pointer dereferences from failed memory allocation.
+
+**Bug pattern:**  
+Unconditional use of the return value of a potentially failing allocator.
+
+**More precise pattern description:**
+
+In kernel code, a dynamically allocated buffer is obtained with a function that can return `NULL` on failure (e.g., `kzalloc`, `kmalloc`, `devm_kzalloc`, `vmalloc`, etc.), but the return value is used immediately without checking for `NULL`.
+
+**Concrete instance from the patch:**
+
+
+if (op->dummy.nbytes) {
+    tmpbuf = kzalloc(op->dummy.nbytes, GFP_KERNEL);
+    memset(tmpbuf, 0xff, op->dummy.nbytes);  // potential NULL dereference
+    ...
+}
+
+
+The patch adds:
+
+
+tmpbuf = kzalloc(op->dummy.nbytes, GFP_KERNEL);
+if (!tmpbuf)
+    return -ENOMEM;
+memset(tmpbuf, 0xff, op->dummy.nbytes);
+
+
+**Reusable checker rule:**
+
+Flag any path where:
+
+1. A pointer `p` is assigned the result of an allocation function that may return `NULL` on failure, and
+2. There is no intervening `NULL` check on `p` before it is dereferenced (used as an argument to functions requiring a valid pointer, e.g., `memset`, `memcpy`, `str*`, `->field`, `*p`, array indexing, etc.), and
+3. The function is not documented/annotated as “never returns NULL” in this context (e.g., not `kzalloc(..., GFP_KERNEL | __GFP_NOFAIL)` or a wrapper guaranteed to succeed).
+
+In short: **"Result of possibly-failing memory allocation is dereferenced without a preceding NULL check."**
+
+**Bug pattern:**  
+Missing NULL-check after dynamic allocation before dereferencing the allocated pointer.
+
+**Context from patch:**
+
+
+pcpu_sum = kvmalloc_array(num_possible_cpus(),
+			  sizeof(struct netvsc_ethtool_pcpu_stats),
+			  GFP_KERNEL);
+/* Missing originally: */
+if (!pcpu_sum)
+    return;
+
+netvsc_get_pcpu_stats(dev, pcpu_sum);
+for_each_present_cpu(cpu) {
+    struct netvsc_ethtool_pcpu_stats *this_sum = &pcpu_sum[cpu];
+    ...
+}
+
+
+**Abstract bug pattern (suitable for a checker):**
+
+1. A function that may return `NULL` on failure (e.g., `kmalloc`, `kvmalloc`, `kvmalloc_array`, `vzalloc`, `devm_kmalloc`, etc.) is called:
+   ```c
+   T *p = may_fail_alloc(...);
+   
+2. The return value `p` is used in any of these ways **without an intervening check that `p != NULL`**:
+   - passed as a non-`nullable` pointer argument to another function (e.g., `netvsc_get_pcpu_stats(dev, p);`)
+   - indexed / dereferenced (e.g., `p[i]`, `*p`, `p->field`)
+   - used in `&p[index]` or pointer arithmetic (`p + i` then dereferenced)
+
+3. There is no prior control-flow that guarantees `p` is non-NULL (no `if (!p) return;`, `BUG_ON(!p);`, etc.) on all paths reaching the use.
+
+**Concrete instantiation here:**
+
+- `pcpu_sum` is assigned from `kvmalloc_array(...)`, which can return `NULL`.
+- `pcpu_sum` is then:
+  - passed to `netvsc_get_pcpu_stats(dev, pcpu_sum);`
+  - indexed as `&pcpu_sum[cpu]`
+- There was no `if (!pcpu_sum) ...` check before these uses, so a failed allocation would lead to NULL dereference.
+
+**How a static checker could detect this:**
+
+- Model `kvmalloc_array` as a function that may return `NULL`.
+- For each assignment `p = kvmalloc_array(...);`
+  - Build the control-flow paths from this assignment to all subsequent uses of `p`.
+  - If there exists a path where `p` is dereferenced or used as a non-null pointer argument *without* a dominating check `if (!p)` (or equivalent assertion) that aborts/returns on failure, report a potential NULL dereference.
+
+This pattern generalizes to: **“Use of possibly-NULL result from a kernel allocation API without a guarding NULL check before dereference or non-null use.”**

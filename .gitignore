@@ -1,0 +1,102 @@
+# ===================================================================
+# SQuire Project .gitignore
+# ===================================================================
+
+# -------------------------------------------------------------------
+# 1. Secrets & Configuration
+# NEVER commit API keys or other secrets.
+# -------------------------------------------------------------------
+# Your file for storing LLM API keys
+llm_keys.yaml
+*.env
+
+# It's also good practice to ignore general config files that might
+# contain local paths or eventually hold secrets. Track a template instead.
+config.yaml
+# Example: You would track 'config.example.yaml' but not 'config.yaml'
+
+
+# -------------------------------------------------------------------
+# 2. Python Environment & Dependencies
+# These are specific to your local machine and can be recreated.
+# -------------------------------------------------------------------
+# Virtual environment folders
+venv/
+.venv/
+env/
+.env/
+
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+
+# -------------------------------------------------------------------
+# 3. Datasets & Large External Codebases
+# -------------------------------------------------------------------
+# Any other large datasets or raw mined data
+/mined_patches_raw/
+/mined_patches_curated/
+/kernel_snapshots/
+
+
+# -------------------------------------------------------------------
+# 4. Generated Artifacts, Logs, and Outputs
+# Your repository should contain the code that GENERATES these files,
+# not the files themselves.
+# -------------------------------------------------------------------
+# Generated Coccinelle checkers
+/generated_checkers/
+
+# Evaluation results, reports, and logs
+/evaluation_results/
+/triage_reports/
+*.log
+*.csv
+# Be more specific if you want to track certain JSON/CSV files (like your curated dataset)
+# For example:
+# !my_curated_dataset.json
+
+# Coccinelle backup files
+*.bak
+*~
+
+
+# -------------------------------------------------------------------
+# 5. IDE & Editor Configuration
+# These are user-specific preferences.
+# -------------------------------------------------------------------
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+nbproject/
+
+
+# -------------------------------------------------------------------
+# 6. OS-specific files
+# -------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+._*
