@@ -1,229 +1,599 @@
-Plan for a Clang Static Analyzer (CSA) checker: “Require dominating non-NULL guard before first use of possibly-NULL/optional pointers”
+Below is an organized plan for implementing a Clang Static Analyzer checker that captures “mis-handling of possibly-NULL pointers”: missing NULL checks and NULL checks on the wrong expression.
 
-1) Core logic to capture
-- Goal: For any pointer that may be absent/NULL or be an ERR_PTR from designated sources, ensure the first use is dominated by a check establishing non-NULL (and non-ERR when applicable) along all paths.
-- Sources to taint as PossiblyNull:
-  - Memory allocators/mappers: kmalloc/kzalloc/kmalloc_array/kcalloc/kvmalloc/vmalloc/vzalloc/devm_kmalloc/devm_kzalloc/ioremap/devm_ioremap and variants.
-  - Device/bus match data: id->driver_data, platform_device_id::driver_data, usb_device_id::driver_info, of_/acpi_/device_get_match_data, etc.
-  - Optional-get APIs: gpiod_get_optional/devm_gpiod_get_optional, DRM *_property fetches, other “optional get” functions documented to return NULL when absent and ERR_PTR on error.
-  - Any pointer later explicitly NULL-checked (heuristic: if code checks p == NULL at any point, mark p as PossiblyNull from its last assignment).
-- Uses that require non-NULL:
-  - Dereference and derived: *p, p->f, p[i], pointer arithmetic used for access.
-  - Passing to known APIs that require valid pointer or MMIO object (e.g., memcpy, memset, readl/writel families, drm property setters, gpiod_to_irq, init APIs taking pointer).
-  - Interprocedural conservative rule: passing to unknown functions is treated as a use unless modeled otherwise.
-- Dominance requirement:
-  - The first use after a tainting assignment must be control-dominated by a guard that proves p != NULL (and not ERR_PTR when relevant), covering all paths to the use in the current exploded graph state.
-  - In loops, each iteration must be guarded; partial guards are violations.
-- Specialized tri-state for optional-get APIs:
-  - Values: ERR_PTR(e), NULL (absent), valid pointer.
-  - Require explicit handling: if (IS_ERR(p)) … else if (!p) … else … before use; only checking IS_ERR then using p is a violation.
+I’ll structure it along the requested items and assume we’re writing a path‑sensitive checker on top of CSA’s `CheckerContext`/`ProgramStateRef` APIs.
 
-2) Program states and data structures to maintain
-- Per-symbol metadata map: RegionState: MemRegion -> PointerState
-  - PointerState fields:
-    - SourceKind: {Allocator, Mapper, MatchData, OptionalGet, LaterChecked, Unknown}
-    - TriStateMode: {None, ErrOrNullOrValid} (for IS_ERR/optional APIs)
-    - CheckedStatus: bitmask
-      - CheckedForNull: bool (known true in current path)
-      - CheckedNotErr: bool (known true in current path)
-    - FirstAssignmentStmt: ProgramPoint (for diagnostics location)
-    - FirstUseReported: bool (avoid duplicate reports)
-    - LastValueSVal (optional, for debugging/notes)
-- For path-sensitive guard reasoning:
-  - A refinement lattice over each pointer symbol:
-    - ValueClass: {Unknown, DefinitelyNull, DefinitelyErrPtr, DefinitelyNonNullNonErr}
-  - We derive ValueClass via branch conditions and model calls like IS_ERR, IS_ERR_OR_NULL, if (p), if (!p), comparisons with NULL.
-- Auxiliary:
-  - KnownFunctionSet with semantics:
-    - TaintSources: function name -> {SourceKind, TriStateMode?}
-    - NonNullRequiredParams: function name -> set<int> indices
-    - GuardFunctions: e.g., IS_ERR, IS_ERR_OR_NULL, IS_REACHABLE? -> evaluation semantics
-  - Expr-to-Region mapping: use getMemRegionFromExpr().
-  - Region equivalence tracking: when pointers are assigned/propagated p = q, transfer PointerState to new region symbol.
-  - Loop context info (optional): minimal approach uses path-sensitive guard states; we don’t need full loop post-dominance if we rely on ExplodedGraph states.
+---
 
-3) Callback functions and purposes
-- checkPostCall
-  - Identify source functions that can return NULL/ERR_PTR and taint the return value’s region with PointerState(SourceKind=..., TriStateMode if applicable).
-  - Identify calls that require non-NULL parameters; treat argument evaluation as a “use” site.
-  - Model guard-return helpers: IS_ERR(x), IS_ERR_OR_NULL(x), PTR_ERR_OR_ZERO, etc., by binding path predicates to ValueClass updates when their results are used in conditions.
-- checkBind
-  - When a value is assigned/bound to a variable/field, propagate PointerState from RHS region/symbol to LHS’s region.
-  - When binding NULL/ERR_PTR constant to a region, update ValueClass accordingly.
-  - When p is re-assigned, reset its PointerState per new RHS; clear CheckedStatus and FirstUseReported.
-- checkBranchCondition
-  - Interpret conditional expressions to update ValueClass and CheckedStatus on the true/false successor states:
-    - if (p): true branch -> CheckedForNull=true; ValueClass=DefinitelyNonNullNonErr (unless TriStateMode requires NotErr check), false branch -> DefinitelyNull.
-    - if (!p) or p == NULL: true -> DefinitelyNull; false -> CheckedForNull=true.
-    - if (IS_ERR(p)): true -> DefinitelyErrPtr; false -> CheckedNotErr=true.
-    - if (IS_ERR_OR_NULL(p)): true -> PossiblyNullOrErr (we can split: either null or err); false -> CheckedForNull=true and CheckedNotErr=true.
-    - if (PTR_ERR_OR_ZERO(p)): doesn’t directly prove non-NULL; treat only when combined with IS_ERR logic if recognizable.
-- checkLocation
-  - Detect memory reads/writes via pointer dereference, structure/array access, pointer arithmetic used for access. For the base pointer region involved, treat as a “use.”
-- checkPostStmt for ArraySubscriptExpr/MemberExpr/UnaryDeref/UnaryOperator(‘*’) and for CallExpr arguments
-  - Alternative to checkLocation: directly catch AST-level uses and map to regions.
-- checkPreCall
-  - Before calling a function, check each argument that maps to a region tracked as PossiblyNull; if callee requires non-NULL for that parameter (from NonNullRequiredParams or default conservative rule), treat as a use requiring dominance.
-- checkEndFunction / checkDeadSymbols
-  - Cleanup PointerState entries; prune to avoid leaks.
-- checkPostStmt(DeclStmt/VarDecl)
-  - On initialization from a tainted source or from a pointer field known optional (name heuristics: ExprHasName("*_property") etc.), tag the variable’s region.
+## 1. Key expressions and their roles
 
-4) Sequence of steps to mark, validate, or report a violation
-A) Taint introduction
-- In checkPostCall:
-  - If call to a known source function S:
-    - Obtain return region R via getMemRegionFromExpr(callExpr).
-    - Create PointerState with:
-      - SourceKind based on S, TriStateMode = ErrOrNullOrValid for optional-get or IS_ERR-capable APIs, else None.
-      - CheckedStatus = {false,false}, FirstAssignmentStmt = current ProgramPoint.
-    - Store in State map: RegionState[R] = PointerState.
-- In checkBind:
-  - If RHS is a call result already tainted or a field known as match-data or *_property by name, taint LHS region similarly.
-  - If RHS is NULL: mark ValueClass=DefinitelyNull for LHS region.
-  - If RHS is taken from a symbol with PointerState, copy PointerState to LHS; maintain alias tracking as needed.
+We want to clearly distinguish three roles and track them explicitly:
 
-B) Guard recognition and propagation
-- In checkBranchCondition:
-  - Identify guards that reference tracked regions:
-    - p, p != NULL, p == NULL, !p, IS_ERR(p), IS_ERR_OR_NULL(p).
-  - For the true/false successor states, update:
-    - ValueClass and CheckedStatus flags.
-  - Example: After if (p) { … } we set CheckedForNull=true for that region on the taken branch; after else branch, DefinitelyNull.
+### 1.1 Allocation/source expression
 
-C) Use-site detection
-- In checkLocation and checkPostStmt(AST use):
-  - On dereference/MemberExpr/ArraySubscriptExpr/UnaryDeref/Pointer arithmetic used as base for memory access:
-    - Base region RB = getMemRegionFromExpr(baseExpr).
-    - If RB has PointerState and FirstUseReported=false:
-      - Validate dominance: Is current path state proving RB is non-null (and non-ERR when TriStateMode applies)?
-        - Condition: ValueClass == DefinitelyNonNullNonErr, or CheckedForNull=true and (TriStateMode==None or CheckedNotErr=true).
-      - If not proven:
-        - Report violation via reportUncheckedDereference(node, RB, FirstAssignmentStmt, sourceKind, useKind).
-        - Mark FirstUseReported=true (to suppress duplicates for this path/use).
-- In checkPreCall:
-  - For each argument Ai with region RA and PointerState:
-    - If callee is known to require non-NULL for parameter i or we apply conservative rule that pointers passed by value are uses unless explicitly nullable:
-      - Apply same validation as above; if not proven non-NULL/non-ERR, report.
-  - Special-case len=0 APIs? Optional: skip if model says argument can be NULL when length is zero; this requires API modeling.
+Definition (conceptual):
+- An **allocation/source expression** is an expression whose value may legitimately be `NULL` and must be checked before dereference.
 
-D) Optional-get tri-state enforcement
-- In checkPreCall/checkLocation:
-  - For TriStateMode pointers, require both CheckedNotErr and CheckedForNull before use.
-  - Patterns to accept:
-    - if (IS_ERR(p)) return err; if (!p) return 0; … use p …
-    - if (IS_ERR_OR_NULL(p)) … handle … else … use p …
-  - Anti-pattern:
-    - if (IS_ERR(p)) return err; … use p … without null-check => report.
-- In branch modeling, IS_ERR_OR_NULL(p) false branch sets both flags true.
+Examples:
+- Return values of modelled alloc/mapping APIs:
+  - `malloc(...)`, `calloc(...)`, `kzalloc(...)`, `kvmalloc_array(...)`, `ioremap(...)`, `devm_kmalloc(...)`, etc.
+- Loads from containers that can hold NULL:
+  - `p = arr[i];`
+  - `p = list_node->ptr;`
+- Optional fields:
+  - `ci = id->driver_data;` where some `id` entries have `.driver_data = NULL`.
 
-E) Dominance across loops and partial guards
-- Rely on path-sensitive state:
-  - Each use is evaluated in its current path with the guard flags. If some paths reach the use with flags unset, CSA will produce a bug report along those paths; if all paths have guards, no bug.
-- Partial guard detection:
-  - If in a loop body there is a use of p before any guard in the path to that use, it will be reported for those paths (e.g., iterations where guard is skipped).
-- Early-continue/return modeling:
-  - If code has if (!p) continue; then for paths reaching later uses in the same iteration, p is known non-NULL; this is captured by CheckedForNull set on the fall-through path and the branch that continues prunes the violating path.
+Concrete representation:
+- In the checker code, the **allocation/source expression** will be:
+  - The `Expr *` for the call itself (e.g., the `CallExpr` representing `malloc(...)`), or
+  - The `Expr *` that is the RHS of an assignment / binding from a known “maybe-null” source.
+- We also want to record the memory region that holds this value (e.g., the region for the variable `p` that was assigned the result).
 
-F) “Later-checked” heuristic
-- In checkBranchCondition:
-  - If we observe a comparison p == NULL or p != NULL for a region that currently has no SourceKind but is pointer-typed, retroactively mark it as PossiblyNull with SourceKind=LaterChecked (unless already known non-null). This enables flagging prior dereferences before the first dominating check.
-- In use detection:
-  - If a dereference occurs before any guard has proven non-NULL (CheckedForNull=false) and the pointer is marked LaterChecked due to later comparisons elsewhere on the path/function, report.
+So for each such source, we need:
+- `AllocExpr` – an `Expr *` pointing to the expression where the “maybe-null” value originates (e.g., call or load).
+- `AllocRegion` – a `const MemRegion *` representing where this value is stored (variable, field, element, etc.).
 
-G) Reducing false positives
-- Recognize nofail patterns (heuristic):
-  - If allocator call includes GFP flag known to be NOFAIL and we can parse it, clear taint. Otherwise, default to taint.
-- Recognize ASSERT-like macros:
-  - If BUG_ON(!p) or WARN_ON(!p) precedes use, treat as a guard (BUG_ON dominates via abort); model as CheckedForNull on the non-crash path.
-- Respect intrinsics like nonnull attributes:
-  - If a function parameter is annotated nonnull, do not taint that parameter in this checker.
-- Reassignments:
-  - If p is reassigned to a known valid address (taking address of object &obj), clear taint.
-- Null-check via switch/case patterns:
-  - Limited: if we see switch (!!p) or ternary guards, map them similarly in checkBranchCondition or checkPostStmt(ConditionalOperator).
+### 1.2 Check/guard expression
 
-H) Diagnostic content
-- reportUncheckedDereference should include:
-  - Pointer name (from ExprHasName if available), source location of first assignment and of the use, and short reason:
-    - “Pointer from ‘kmalloc’ may be NULL; first use is not dominated by a non-NULL check.”
-    - “Optional pointer from gpiod_get_optional requires NULL and ERR checks before use; found use without NULL check.”
-    - “Pointer later NULL-checked is dereferenced before the check.”
-- Provide fix hints:
-  - Insert early guard after assignment: if (!p) return -ENOMEM; or IS_ERR/NULL tri-state handling.
+Definition:
+- A **check/guard expression** is an expression used in a condition that tests a pointer for being NULL vs non-NULL, such that the NULL branch leads to an escape from the current context (return/goto/break/continue/abort/assert) or the non-NULL branch dominates the later dereference.
 
-Implementation details per callback
-- checkPostCall(CallEvent CE, CheckerContext C)
-  - If CE.getCalleeIdentifier() in TaintSources:
-    - Region R = getMemRegionFromExpr(CE.getOriginExpr())
-    - Create PointerState with SourceKind and TriStateMode.
-    - State = State.set(R, PointerState)
-    - C.addTransition(State)
-  - For guard functions, record symbolic eval info in ProgramState as needed (e.g., map SymExpr -> GuardKind) to help branch modeling.
-- checkBind(SVal location, SVal val, SVal origin, CheckerContext C)
-  - If val refers to a region RS that has PointerState, set that state on destination region RD; clear FirstUseReported.
-  - If val is zero/null SVal: set ValueClass=DefinitelyNull for RD.
-  - If val is from &obj: clear taint on RD.
-- checkBranchCondition(IfStmt/WhileStmt/DoStmt/ForStmt condition, CheckerContext C)
-  - Extract base expressions and model:
-    - p, !p, p == NULL, p != NULL.
-    - CallExpr to IS_ERR, IS_ERR_OR_NULL.
-  - Use assume() on symbolic values to distinguish T/F states; update CheckedStatus and ValueClass in successor states.
-- checkLocation(SVal l, bool isLoad, const Stmt* S, CheckerContext C)
-  - If l is a MemRegionVal or derived from a pointer region RB with PointerState:
-    - Validate as “use.” If violation, emit reportUncheckedDereference.
-- checkPostStmt(MemberExpr/ArraySubscriptExpr/UnaryOperator('*')/BinaryOperator with pointer arithmetic)
-  - Extract base region; delegate to same validation logic as in checkLocation.
-- checkPreCall
-  - For each argument Ai:
-    - RA = getMemRegionFromExpr(Ai)
-    - If RA has PointerState and callee requires non-NULL for this param (from NonNullRequiredParams or default rule), validate and report if unproven.
-- checkDeadSymbols
-  - Remove PointerState entries for dead regions; reset temporary ValueClass.
+Examples:
+- `if (!p) return;`
+- `if (p == NULL) goto err;`
+- `assert(p);`
+- `BUG_ON(!p);`
+- `if (!ring) continue;` in a loop; later uses in the same iteration should be considered guarded.
 
-Known function modeling (seed sets)
-- TaintSources:
-  - {"kmalloc","kzalloc","kmalloc_array","kcalloc","kvmalloc","vmalloc","vzalloc","devm_kmalloc","devm_kzalloc","ioremap","devm_ioremap", "...variants"}
-  - {"gpiod_get_optional","devm_gpiod_get_optional"} -> TriStateMode
-  - {"of_device_get_match_data","acpi_device_get_match_data","device_get_match_data"} -> SourceKind=MatchData
-- GuardFunctions:
-  - {"IS_ERR","PTR_ERR","ERR_PTR","IS_ERR_OR_NULL"}
-- NonNullRequiredParams:
-  - {"memcpy","memset","memmove"} -> {0,1} as applicable
-  - {"readl","writel","drm_object_property_set_value","gpiod_to_irq"} -> param indices that must be valid
-  - Extendable via a JSON or table and attributes like __must_check or __nonnull when available.
-- Name heuristics:
-  - ExprHasName("*_property") -> mark as OptionalGet semantics when assigned.
+Concrete representation:
+- The “check expression” being tested for nullness: an `Expr *` which, after stripping casts, etc., yields a pointer-valued expression.
+- `GuardExpr` – that pointer expression, plus:
+  - The branch (true/false) that corresponds to `P == NULL` vs `P != NULL`.
+  - Whether that branch is known to **escape** (no later uses reachable on that path).
 
-Validation rules summary
-- A use is safe if:
-  - ValueClass == DefinitelyNonNullNonErr; or
-  - CheckedForNull == true AND (TriStateMode==None OR CheckedNotErr==true)
-- Otherwise, report.
+### 1.3 Dereference expression
 
-Examples flagged
-- p = kmalloc(...); p->field = ...; // no check -> report
-- p = gpiod_get_optional(...); if (IS_ERR(p)) return PTR_ERR(p); do_something(p); // missing NULL check -> report
-- foo = p->x; if (!p) return; // deref before dominating check -> report
-- if (p) use1(p); use2(p); // if use2 is outside the if, report for use2.
+Definition:
+- A **dereference expression** is any expression that requires the pointer to be non-NULL.
 
-Examples accepted
-- p = kmalloc(...); if (!p) return -ENOMEM; p->field = ...;
-- p = gpiod_get_optional(...); if (IS_ERR(p)) return err; if (!p) return 0; use(p);
-- if (!p) continue; // in loop; later deref in same iteration is safe.
+Examples:
+- Direct dereference:
+  - `*p`, `p->field`, `p[i]`
+- Address-of subobject implying non-null:
+  - `&p->field`
+- Passing `p` to a modeled “non-null required” parameter:
+  - `memset(p, ...)`, `mutex_init(p)`, custom kernel helper known to dereference.
 
-Testing strategy
-- Unit tests per source kind and per guard pattern.
-- Tri-state tests for optional-get APIs with each of: ERR_PTR, NULL, valid.
-- Loop partial-guard tests.
-- Match-data fields with possibly zero driver_data entries.
+Concrete representation:
+- `DerefExpr` – the `Expr *` that syntactically performs or implies deref.
+- `DerefRegion` – the `const MemRegion *` representing the base pointer being dereferenced.
 
-Performance considerations
-- Minimize interprocedural overhead: model only selected known APIs for NonNullRequiredParams.
-- Use on-demand state map keyed by MemRegion and prune in checkDeadSymbols.
-- Avoid reporting duplicates by FirstUseReported flag and by uniqueing BugReports per path.
+We want to connect:
+- `DerefRegion` → back to the `AllocRegion` and `AllocExpr` that introduced “maybe null”.
+- `GuardExpr` → the corresponding region; later we check if `GuardRegion` == `DerefRegion` (or an alias) and whether the guard dominates the dereference.
 
-Extensibility
-- Add new sources and non-NULL-requiring APIs via a central registry.
-- Optionally integrate dominance/post-dominance data from the AST/CFG to augment path reasoning if needed.
-- Add annotations to suppress or assert non-NULL via comments/pragmas if desired.
+---
+
+## 2. Core logic to capture
+
+We want **one unified rule** that detects:
+
+1. Missing NULL checks on possibly-NULL pointers.
+2. NULL checks on the wrong expression (different from the one dereferenced).
+
+### 2.1 High-level rule
+
+For any region `R` holding a pointer `P` that may be NULL:
+
+- On a given path, whenever we see a **dereference** of `P` (or non-null-required use),
+  - we must ensure that along that path:
+    - There is a **dominating guard** that checks `P` (or an alias of `P`) for NULL, and
+    - On the `P == NULL` branch, execution escapes in a way that makes the dereference unreachable.
+
+If:
+- There is no such guard, or
+- The only guards are for some other region `Q` (non-alias of `R`),
+
+then we report the bug.
+
+### 2.2 Handling “missing checks”
+
+Core idea:
+- Maintain state: “Region `R` is maybe-null and currently unchecked”.
+- As we traverse along a path:
+  - When we see a dereference of `R` and `R` is still “maybe-null and unchecked”, we emit a bug.
+
+### 2.3 Handling “check on wrong expression”
+
+Core idea:
+- For a dereference of `R`, we inspect:
+  - Whether `R` itself (or an alias) has been checked.
+  - Whether there is a *nearby* null check in the source code, but for a different region `Q`, which is not alias of `R`.
+
+Implementation approach:
+- Basic path-sensitive logic will already tell us which region was checked (`GuardRegion`) and which region is dereferenced (`DerefRegion`).
+- When `DerefRegion` is unguarded but within a branch where some other `GuardRegion` was checked, we can:
+  - Emit a more specific message: “Pointer `P` may be NULL; `Q` is checked instead.”
+
+Practically:
+- The same machinery for tracking checked regions works.
+- The “wrong variable checked” is essentially a specialization of “missing guard on P” where we additionally detect that *some* guard is present but for a different region.
+
+---
+
+## 3. Program state and data structures
+
+We need a custom `ProgramState` trait storing:
+
+1. **Maybe-null regions** and their source info.
+2. **Checked regions** along the path.
+3. Simple alias/equivalence information.
+
+### 3.1 Representing “maybe-null” status
+
+Use a `ProgramState` map from regions to a custom `PointerInfo`:
+
+
+struct PointerInfo {
+  const Expr *AllocExpr; // where we considered it maybe-null
+  enum Status { MaybeNullUnchecked, NonNull, Null, MaybeNullChecked } Status;
+};
+
+
+We primarily care about:
+- `MaybeNullUnchecked` – region is potentially NULL and hasn’t been proven non-NULL or guarded.
+- `MaybeNullChecked` – region is maybe-null, but we know an appropriate “escape-on-null” guard already dominated.
+- `NonNull` – proven non-NULL by path constraints (e.g., branch `if (!p) return;` then else branch).
+- `Null` – proven NULL (useful for some reasoning, and to avoid false positives when deref would be infeasible in CSA).
+
+Implementation:
+- `typedef llvm::ImmutableMap<const MemRegion *, PointerInfo> PointerStateMap;`
+- Store it in `ProgramState` via a `REGISTER_MAP_WITH_PROGRAMSTATE`.
+
+We will update this map in:
+- `checkPostCall` and `checkBind` (for newly created or assigned pointers).
+- `checkBranchCondition` (to record checked regions and branch semantics).
+- `checkLocation` (we read the status when we see deref).
+
+### 3.2 Recording which regions have been NULL-checked
+
+We have two related notions:
+
+1. **Path constraints**: The core CSA engine already splits states on conditions like `if (p)`; some paths will constrain `p` to be non-NULL.
+2. **Guard/escape semantics**: Checks where `p == NULL` leads to an escape need to mark “no path with `p == NULL` continues to later deref”.
+
+We can encode this guard semantics in `PointerInfo.Status`:
+
+- When we detect a check like:
+  ```c
+  p = malloc(...);
+  if (!p)
+    return;
+  use(p);  // later
+  
+  we want the subsequent state (in the branch that falls through to `use(p)`) to record `p` as:
+  - `Status = NonNull` (from path constraints), and optionally
+  - Or at least `MaybeNullChecked` (meaning, even if the solver doesn’t deduce non-null, we know semantics guarantee it).
+
+But CSA usually *will* mark such branch as `p != NULL` if the condition is simple. We still want an explicit guard notion because:
+- Some macros or helpers (`BUG_ON`, kernel error handling) may not be recognized as simple comparisons.
+- Some patterns like `if (p) { ... } else { error; return; }` require more explicit reasoning.
+
+Simplification:
+- Prefer to rely on the engine’s constraints to mark `p` as `NonNull` in guarded branches.
+- On top of that, maintain a set of **guarded regions** (for fallback, especially for complicated macros).
+
+Data structure:
+- `GuardedRegions` – `ImmutableSet<const MemRegion *>` of regions that have a dominating guard along the current path.
+
+We can store in state:
+
+typedef llvm::ImmutableSet<const MemRegion *> GuardedRegionSet;
+
+
+When a guard is recognized and the path that continues cannot see `p == NULL`, we:
+
+- Add `R` to `GuardedRegions`.
+- Possibly update `PointerInfo.Status` of `R` to `MaybeNullChecked` or `NonNull`.
+
+### 3.3 Alias / equivalence information
+
+We need basic alias tracking sufficient to handle:
+
+- `q = p;` → dereferences of `q` should be treated as dereferences of `p`.
+- Struct/field copies:
+  - `tmp->symbol = strdup(...);`
+  - Later: `p = tmp->symbol; if (!list->symbol) ...; use(p);`
+- Container loads:
+  - `p = arr[i];` where `arr[i]` is known maybe-null; `p` is alias to that element.
+
+We don’t need full alias analysis, just a simple equivalence relation.
+
+Data structure:
+- Another map in `ProgramState`:
+
+
+typedef llvm::ImmutableMap<const MemRegion *, const MemRegion *> AliasMap;
+
+
+Semantics:
+- `AliasMap[R] = RootR;` meaning “R is known to hold the same pointer as RootR”.
+- Maintain *canonical representatives*:
+  - Use union-find-like canonicalization, or simpler:
+    - Always collapse to the earliest known root (`RootR` with no alias entry pointing to it).
+
+Helper:
+- `const MemRegion *getCanonicalRegion(const MemRegion *R, ProgramStateRef S);`
+  - Follows `AliasMap` to the canonical root.
+
+Whenever we:
+- Bind one pointer region from another (`checkBind`), we set alias `Rdst` → `Rsrc`.
+- When we update `PointerStateMap`, we always use canonical regions.
+
+---
+
+## 4. CSA callbacks and responsibilities
+
+We’ll implement a checker (e.g. `MisHandledNullChecker`) with the following callbacks:
+
+### 4.1 `checkPostCall`
+
+Purpose:
+- Detect “maybe-null” sources at the point of call return,
+- Tag the returned region appropriately.
+
+Steps:
+1. Get the called function name (`CallEvent`).
+2. If `ExprHasName(callee, "malloc" /* etc. */)` or another modeled API:
+   - Get the return `SVal` (`Call.getReturnValue()`).
+   - Map it to its region via `getMemRegionFromExpr` or `ReturnValue.getAsRegion()`.
+3. If the region `R` is non-nullable by known modeling (e.g., `kmalloc` with `__GFP_NOFAIL`) you might skip; otherwise:
+   - Insert into `PointerStateMap`:
+     - `AllocExpr` = `Call.getOriginExpr()`.
+     - `Status` = `MaybeNullUnchecked`.
+4. If the return value is directly bound to a variable by the same statement, `checkBind` will also be invoked; you may optionally record alias there as well.
+
+Also:
+- If the function is a known null-checking helper (e.g., `BUG_ON(!p)`), see if you can interpret its argument as a guard in combination with `checkBranchCondition`.
+
+### 4.2 `checkBranchCondition`
+
+Purpose:
+- Identify NULL checks and map them to regions.
+- Update path constraints / guard state.
+
+Steps:
+1. Get the branch condition `Cond` (`const Stmt *Condition`).
+2. Check if `Cond` is a null-check pattern:
+   - `p == NULL`
+   - `p != NULL`
+   - `!p`
+   - macros that expand to them (after peeling casts and parens).
+3. Extract the pointer expression `GuardExpr` from `Cond`:
+   - Use helper: `const MemRegion *R = getMemRegionFromExpr(GuardExpr)`.
+   - Canonicalize: `R = getCanonicalRegion(R, State);`.
+
+4. Depending on the actual branch being taken (`Context.isTrue()` or not) and the form:
+   - For `if (p == NULL) { /* true branch */ } else { /* false branch */ }`:
+     - True branch: `p == NULL`
+     - False branch: `p != NULL` (non-null).
+   - For `if (p)`:
+     - True branch: `p != NULL`
+     - False branch: `p == NULL`.
+   - Translate into:
+     - On non-null branch: mark `R` as definitely non-null (`PointerInfo.Status = NonNull`) and possibly add to `GuardedRegions`.
+     - On null branch: `PointerInfo.Status = Null`.
+
+5. Detect if this check is a **guard that escapes on NULL**:
+   - We’ll only know that when we examine successors or from context patterns (often easier in `checkBranchCondition` + inspecting the branch body).
+   - Heuristic: In the `p == NULL` (or `!p`) branch:
+     - Inspect the body of the branch for:
+       - `return`, `goto`, `break`/`continue` that exit the function/loop before any later use.
+     - Or known error-handling macros.
+   - If we detect an unconditional escape in that branch:
+     - On the *other* branch (where we proceed with potential dereferences),
+       - mark `R` as *guarded*:
+         - add to `GuardedRegions`.
+         - set `PointerInfo.Status` to `NonNull` or `MaybeNullChecked`.
+
+Simplification:
+- We may start simple: treat “`if (!p) return;`” as the canonical pattern:
+  - Branch condition `!p` + body with `return` only.
+- Extend over time to handle `goto err;` / loops.
+
+### 4.3 `checkBind`
+
+Purpose:
+- Handle assignments/initializations:
+  - Propagate maybe-null status from RHS to LHS.
+  - Record alias relations.
+  - Propagate guard information when appropriate.
+
+Steps:
+1. Inputs: `SVal LHS, SVal RHS`.
+2. Get regions:
+   - `Rlhs = LHS.getAsRegion();`
+   - `Rrhs = RHS.getAsRegion();`
+3. Canonicalize: `Rrhs = getCanonicalRegion(Rrhs, State);`.
+4. If `Rrhs` exists and is in `PointerStateMap`:
+   - Propagate pointer info:
+     - Attach `PointerInfo` to `Rlhs` as a copy of `Rrhs`’s info.
+   - Record alias:
+     - Update `AliasMap[Rlhs] = Rrhs`.
+   - If `Rrhs` is in `GuardedRegions`, optionally also add `Rlhs` to `GuardedRegions`.
+
+5. If RHS is a function call result (and not covered by `checkPostCall`), you may still detect known maybe-null sources here:
+   - E.g., `p = arr[i];` – treat as “maybe-null container load”:
+     - Check if `arr[i]` is from a known container; then mark `Rlhs` as `MaybeNullUnchecked`.
+
+6. If the RHS is `NULL` literal or `0`:
+   - Set `PointerInfo.Status = Null` for `Rlhs`.
+
+7. If the RHS is a pointer that we know is non-null (e.g., address-of operator `&x`):
+   - Mark `Rlhs` as `NonNull`.
+
+### 4.4 `checkLocation`
+
+Purpose:
+- Detect dereferences / non-null-required uses.
+- Decide when to report.
+
+Occurs whenever CSA evaluates a memory access location (e.g. `p->field`, `*p`, `p[i]`).
+
+Steps:
+1. Get the `SVal` being accessed and extract base region `R`:
+   - For `p->field`, the `Location` is typically the region of `p->field`; we want the base pointer region.
+   - Use helpers (and AST analysis) to identify the pointer operand:
+     - For `p->field`, `p`.
+     - For `*p`, `p`.
+     - For `p[i]`, `p`.
+2. Map pointer expression to region:
+   - `R = getMemRegionFromExpr(PointerExpr);`
+   - Canonicalize `R = getCanonicalRegion(R, State);`.
+
+3. Look up `PointerInfo` for `R` in `PointerStateMap`.
+   - If no entry and no reason to think it’s maybe-null: do nothing.
+   - If `Status` is `NonNull` or we have strong constraints from the engine that `p` is non-null: do nothing.
+   - If `Status` is `Null`:
+     - This path is likely infeasible; CSA might not explore it as reachable. You can skip reporting here or consider it a separate “always-null-deref” bug if desired.
+   - If `Status` is `MaybeNullUnchecked` or `MaybeNullChecked`:
+     - Now check guard information:
+       - If `R` is in `GuardedRegions` (or constraints say `R != NULL`), the dereference is safe.
+       - Otherwise, we have a potentially unsafe dereference.
+
+4. Distinguish missing check vs wrong-variable check:
+   - Inspect the current path state to see if, in this basic block or immediate predecessors, there was a `GuardRegion` `Q ≠ R` being checked.
+   - If such `Q` exists and is not alias of `R`, customize the report as “wrong-variable check”.
+   - Otherwise, report as “missing NULL check”.
+
+5. Emit report:
+   - Use `reportUncheckedDereference(derefExpr, allocExpr, guardExpr)`:
+     - `derefExpr`: the current dereference expression.
+     - `allocExpr`: `PointerInfo.AllocExpr` for `R`, if exists.
+     - `guardExpr`: if we detected a `Q` checked nearby instead of `R`, pass that; otherwise `nullptr`.
+
+Implement:
+- Construct a `PathSensitiveBugReport`:
+  - Highlight `derefExpr`.
+  - Add `allocExpr` as a note: “Pointer may be NULL here (from this allocation/source).”
+  - If `guardExpr` is not null, add note: “This NULL check uses a different pointer.”
+
+### 4.5 (Optional) `checkDeadSymbols`
+
+Purpose:
+- Clean up state when variables go out of scope to keep state small and avoid stale info.
+
+Steps:
+1. For each dead symbol, identify corresponding regions (e.g., via `SymbolRef` to `MemRegion`).
+2. Remove entries in:
+   - `PointerStateMap`,
+   - `AliasMap`,
+   - `GuardedRegions` for those regions.
+
+---
+
+## 5. Step-by-step behavior on a path
+
+Here is how the checker behaves, path-wise, for the target pattern.
+
+### 5.1 Seeing an allocation/source and marking maybe-null
+
+Example:
+
+p = malloc(size);
+...
+*p = 1;
+
+
+Path steps:
+
+1. `checkPostCall` at `malloc`:
+   - Return value `SVal` → region `RmallocTemp`.
+   - Record `PointerInfo`:
+     - `AllocExpr = malloc(...) CallExpr`.
+     - `Status = MaybeNullUnchecked`.
+
+2. `checkBind` on `p = malloc(...)`:
+   - LHS region `Rp` (for variable `p`).
+   - RHS region `RmallocTemp`.
+   - Record alias: `Rp` → `RmallocTemp`.
+   - Copy pointer info for `Rp`:
+     - `AllocExpr = malloc(...)`.
+     - `Status = MaybeNullUnchecked`.
+
+Now state indicates `p` is maybe-null and unchecked.
+
+### 5.2 Observing guards and marking regions as “checked”
+
+Example:
+
+p = malloc(size);
+if (!p)
+  return;
+*p = 1;
+
+
+Path steps:
+
+1. As above, `p` is `MaybeNullUnchecked`.
+
+2. `checkBranchCondition` on `if (!p)`:
+   - Recognize `!p` as null-check on `p`.
+   - Identify `GuardRegion R` for `p`.
+   - On the true branch (`!p`):
+     - Constraint: `p == NULL`.
+     - Branch body has `return;` → unconditional escape.
+   - On the false branch (the one that leads to `*p`):
+     - Constraint: `p != NULL`.
+     - Update state:
+       - `PointerInfo.Status` for `R` = `NonNull` (or at least `MaybeNullChecked`).
+       - Add `R` to `GuardedRegions`.
+
+3. When we later reach `*p` on this path:
+   - `checkLocation` sees `R` non-null / guarded; no report.
+
+### 5.3 Missing guard: no check before dereference
+
+Example:
+
+p = malloc(size);
+*p = 1;
+
+
+Path steps:
+
+1. `p` = maybe-null as before.
+
+2. No branch involving `p` is encountered.
+
+3. At `*p`, `checkLocation`:
+   - `DerefRegion R = Rp`.
+   - `PointerInfo.Status = MaybeNullUnchecked`.
+   - `R` not in `GuardedRegions`.
+   - CSA engine doesn’t have constraint `p != NULL`.
+
+Decision:
+- Emit diagnostic:
+  - `reportUncheckedDereference(derefExpr = *p, allocExpr = malloc(...) call, guardExpr = nullptr)`.
+
+### 5.4 Wrong-variable guard: check on different pointer
+
+Example:
+
+p = malloc(size);
+q = malloc(size);
+if (!q)
+  return;
+*p = 1;
+
+
+Path steps:
+
+1. After both allocations:
+   - `PointerInfo[Rp] = MaybeNullUnchecked`.
+   - `PointerInfo[Rq] = MaybeNullUnchecked`.
+
+2. `checkBranchCondition` on `if (!q)`:
+   - GuardRegion `Rq` is checked; on the fallthrough branch (where deref happens), we mark `Rq` as guarded/non-null.
+   - `Rp` remains `MaybeNullUnchecked`.
+
+3. At `*p`:
+   - `DerefRegion = Rp`.
+   - `PointerInfo[Rp] = MaybeNullUnchecked`.
+   - `Rp` not in `GuardedRegions`.
+   - However, we see that `GuardedRegions` contains `Rq`.
+   - We can climb up the path or use metadata attached to the state to know that a guard was recently applied to `Rq`.
+
+Decision:
+- Emit diagnostic for `Rp`:
+  - Because there is at least one `GuardRegion` (`Rq`) in scope, we can pick `GuardExpr` as the last guard expression for `Rq` (tracked in state or via bug report visitor).
+  - Call:
+    - `reportUncheckedDereference(derefExpr = *p, allocExpr = malloc(...) for p, guardExpr = expression that checked q)`.
+  - The secondary message explains: pointer `p` may be NULL; `q` is checked instead, leaving `p` unchecked.
+
+### 5.5 Partial guarding in loops (incomplete guard)
+
+Example:
+
+for (...) {
+  ring = rings[i];          // ring maybe-null from container
+  if (ring)
+      use(ring);            // ok
+
+  use(ring->field);         // unguarded deref
+}
+
+
+Path steps in one iteration:
+
+1. `ring = rings[i];` via `checkBind`:
+   - `Rring` becomes `MaybeNullUnchecked`, `AllocExpr` is `rings[i]` (container load).
+
+2. `if (ring)`:
+   - `checkBranchCondition` recognizes check.
+   - True branch: `ring != NULL`; false branch: `ring == NULL`.
+
+3. For the statement `use(ring);`:
+   - On true branch: `ring` is `NonNull`; so safe.
+   - On false branch: not executed; fine.
+
+4. Later `use(ring->field);` in same iteration but outside `if`:
+   - On false branch from `if (ring)` (where `ring == NULL`), control still flows there.
+   - At `ring->field`, `checkLocation`:
+     - `PointerInfo[ring] = MaybeNullUnchecked` or `Null` on that path.
+     - `GuardedRegions` doesn’t mark `ring` as globally guarded, because the earlier `if (ring)` doesn’t escape; it only guarded a localized use inside `if`.
+   - So dereference is considered unsafe.
+
+Decision:
+- Emit diagnostic for `ring->field`:
+  - `allocExpr` = `rings[i]` expression.
+  - `guardExpr` may be null (because the `if (ring)` is not a full guard) or included as context but specifically we say “guard is insufficient / not dominating”.
+
+### 5.6 Optional driver_data / container example
+
+Example:
+
+ci = id->driver_data;   // maybe-null table field
+mm = &ci->misc_map;     // deref without check
+
+
+Path steps:
+
+1. At `ci = id->driver_data;` (`checkBind`):
+   - Recognize `id->driver_data` as maybe-null source (via modelling or table analysis).
+   - `PointerInfo[Rci].Status = MaybeNullUnchecked`.
+   - `AllocExpr = the MemberExpr 'id->driver_data'`.
+
+2. No null checks on `ci`.
+
+3. At `mm = &ci->misc_map;`:
+   - `&ci->misc_map` implies deref of pointer `ci`.
+   - `checkLocation` (or a dedicated check in `checkBind` for address-of-field) recognizes non-null-required use.
+   - `Rci` is maybe-null and unguarded.
+
+Decision:
+- Emit:
+  - `reportUncheckedDereference(derefExpr = &ci->misc_map, allocExpr = id->driver_data, guardExpr = nullptr)`.
+
+---
+
+## Summary
+
+The checker’s strategy:
+
+- Use `checkPostCall` and `checkBind` to mark regions as **maybe-null** sources and propagate that status and alias relations.
+- Use `checkBranchCondition` to:
+  - Recognize NULL-checks,
+  - Distinguish null vs non-null branches,
+  - Mark regions as *guarded* when the null branch escapes.
+- Use `checkLocation` to:
+  - Identify dereferences/non-null uses,
+  - Check if the dereferenced region is known maybe-null and unguarded,
+  - Distinguish between “no guard at all” vs “guard on wrong variable” and emit a contextual diagnostic.
+- Optionally use `checkDeadSymbols` to clean up state.
+
+This plan captures:
+- Missing NULL checks for allocation results,
+- Wrong-variable checks after allocations,
+- Partial guarding in loops,
+- Incorrect assumptions about optional fields/containers,
+under one unified “dominant NULL-check on the same pointer” rule.

@@ -1,59 +1,92 @@
-Generalized rule: Ensure proven non-NULL before first use of pointers that may be absent, optional, or come from fallible providers
+**Unified defect rule: Mis-handling of possibly-NULL pointers (incomplete or incorrect NULL validation before use)**
 
-Summary
-Any pointer originating from a source that can yield NULL (or a special “not present” sentinel) must be proven non-NULL along all control-flow paths before its first use (dereference, indexing, field access, pointer arithmetic, or passing to APIs that require a valid pointer). Partial or misplaced guards are insufficient: the non-NULL check must dominate all uses within the relevant scope/iteration. This applies equally to heap allocations, memory-mapped I/O mappings, bus match data, optional subsystem properties/descriptors, and pointers later checked for NULL.
+### Essence of the rule
 
-Scope of sources
-Track pointers obtained from:
-- Memory allocators and mappers that can return NULL:
-  - kmalloc/kzalloc/kmalloc_array/kcalloc, kvmalloc/vmalloc/vzalloc, devm_kmalloc/devm_kzalloc, ioremap/devm_ioremap and variants.
-- Device/bus match data that can be NULL:
-  - id->driver_data, platform_device_id::driver_data, usb_device_id::driver_info, of_/acpi_/device_get_match_data and equivalents.
-- Optional/conditionally-attached subsystem objects:
-  - DRM properties (e.g., *_property fields), optional GPIO descriptors via gpiod_get_optional/devm_gpiod_get_optional, other “optional get” APIs returning NULL when absent.
-- Any pointer later explicitly NULL-checked:
-  - If code tests p for NULL later, flag any dereference occurring before the dominating check.
+Whenever a pointer may legitimately be `NULL` (because it comes from an allocation/mapping API, an optional metadata field, or a container that may hold NULL entries), **all subsequent dereferences or non‑nullable uses of that pointer must be dominated by a correct NULL check on that same pointer**.  
 
-What counts as “use”
-- Direct dereference: *p, p->field, p[i], pointer arithmetic used for access.
-- Passing to functions that expect valid memory/MMIO/object (e.g., memcpy, readl/writel, drm_object_property_set_value, gpiod_to_irq, synchronization initializers).
-- Interprocedural: passing to callees that (by spec or common contract) require non-NULL; absence of a prior dominating NULL-check is suspicious.
+A bug occurs when:
 
-Dominance requirement
-- The first dereference/use must be post-dominated by a check that establishes p != NULL on every path reaching the use.
-- In loops/iterations, ensure the non-NULL guard covers all uses in that iteration. Partial guards (checking p for some uses but not all) are violations; prefer early-continue on NULL or a single encompassing if (p) block.
+1. The pointer is not checked at all before use, or  
+2. The code checks a *different* pointer (wrong variable/field), or  
+3. The code checks it only for some uses but later dereferences it on a path where it may still be NULL.
 
-Specialized sub-rules/heuristics
-- Array allocators: if the result is later indexed (p[i]) before a dominating NULL-check, report.
-- Optional-return APIs (e.g., gpiod_get_optional):
-  - Distinguish three states: NULL (optional and absent), ERR_PTR (error), valid pointer. Require explicit handling of NULL separate from IS_ERR before use.
-- Match-data pointers: if the match table contains entries where data is 0/unspecified, require a NULL check before dereference in probe/init paths.
-- Optional properties (DRM and similar): fields commonly named *_property may be unassigned; require non-NULL guard before setter APIs.
+This leads to potential NULL pointer dereferences and undefined behavior.
 
-Common anti-patterns to flag
-- Allocate/map then immediately use without check.
-- Check p for NULL only around an early call, then later unguarded p->field use.
-- Initialize locals from p->field before the NULL check on p.
-- Only checking IS_ERR on an API that can also return NULL to mean “absent,” then using the pointer.
+---
 
-Fix patterns
-- Immediately after obtaining the pointer, check:
-  - if (!p) handle/return (-ENOMEM/-EINVAL or skip if optional absent).
-  - For optional-get APIs: if (IS_ERR(p)) handle error; else if (!p) treat as absent and do not use; else use.
-- In loops, either:
-  - if (!p) continue; or
-  - Wrap all uses in if (p) { … }.
-- Ensure the chosen guard dominates all subsequent uses along every path.
+### General rule for a static checker
 
-Checker implementation outline
-- Taint/label pointers from the listed sources as “possibly NULL.”
-- Build a control-flow graph and compute dominance/post-dominance of non-NULL conditions for each use site.
-- Recognize guards: if (p), if (p != NULL), IS_ERR_OR_NULL for APIs supporting ERR_PTR, switch/case patterns that imply non-NULL, and early-continue/break/return forms.
-- Interprocedural awareness: treat passing tainted pointers to known non-NULL-requiring APIs as a use; optionally model common kernel APIs’ expectations.
-- For optional-get APIs, require a tri-state handling pattern; flag code that only checks IS_ERR before use.
-- Reduce false positives by:
-  - Respecting proven non-NULL invariants (e.g., allocation with __GFP_NOFAIL if applicable and honored, though many kernel allocators can still fail).
-  - Tracking reassignment that clears the taint after a successful check.
+For a pointer expression `P` that may be NULL:
 
-Goal
-Prevent NULL-pointer dereferences stemming from unchecked fallible/optional pointer sources or from guards that do not dominate all uses.
+1. **Sources of possibly-NULL pointers**
+
+   Treat the following as *potentially NULL* sources:
+
+   - Return values of allocation/mapping/resource APIs that indicate failure by returning `NULL`, e.g.:
+     - `malloc`, `calloc`, `realloc`, `strdup`, `kzalloc`, `kmalloc`, `kvmalloc`, `kvmalloc_array`, `vzalloc`, `vmalloc`, `devm_kmalloc`, `devm_kzalloc`, `ioremap`, and other modeled APIs.
+   - Optional “driver data” or metadata fields that may be NULL in some table entries, e.g.:
+     - `id->driver_data` from PCI/USB/OF/etc. device ID tables where some entries set `.driver_data = NULL` or leave it zeroed.
+   - Pointers loaded from containers that may hold NULL entries:
+     - Arrays/lists of pointers, e.g., `p = arr[i];`, `p = list_node->ptr;`.
+
+2. **Track uses of `P`**
+
+   After `P` is initialized from one of these sources, identify **unsafe uses** of `P`, including:
+
+   - Direct dereference: `*P`, `P->field`, `P[i]`, `&P[i]` then deref, etc.
+   - Passing `P` (or an expression based on `P`) to a function parameter modeled as non‑nullable or known to dereference its argument (e.g., `memset(P, ...)`, `spin_lock_init(P)`, `mutex_init(P)`, `netvsc_get_pcpu_stats(..., P)`).
+   - Computing the address of a subobject that implies `P` must be valid, e.g., `&P->field`.
+
+3. **Check for correct dominating NULL validation**
+
+   Before each unsafe use of `P`, require that **all control‑flow paths** from the point where `P` is assigned to that use are dominated by a correctness‑preserving check that guarantees `P` is non‑NULL.
+
+   A check is considered valid if it:
+
+   - Tests the **same pointer expression** (or an equivalent alias) as in the use, e.g.:
+     - `if (!P) { ... return; }`
+     - `if (P == NULL) goto err;`
+     - `BUG_ON(!P);`, `assert(P);`, etc.
+   - And on the `P == NULL` branch, performs an **unconditional escape** from the current context so that the unsafe use is not reachable:
+     - `return`, `goto` error label, `break`/`continue` that skips later uses in this iteration, `exit`, etc.
+
+   The following situations **do not** count as safe:
+
+   - Checking a *different* pointer `Q` instead of `P` (wrong-variable NULL check), even if nearby in code:
+     - Example: `p = malloc(...); if (!q) error; use(p);`
+     - Example: `tmp->symbol = strdup(...); if (!list->symbol) goto err; use(tmp->symbol);`
+   - Partially guarding `P` in an `if (P)` block, but then dereferencing `P` later in the same loop body or basic block without an early `continue`, `break`, or `return` on the `P == NULL` path:
+     - Example: inside a loop: 
+       ```c
+       ring = rings[i];
+       if (ring)
+           use(ring);       // guarded
+       use(ring->field);    // unguarded later in same iteration
+       
+   - Assuming non-NULL because some *other* field or table entry is non-NULL, when table analysis shows at least one entry with `P`’s field set to NULL:
+     - Example: `ci = id->driver_data; mm = &ci->misc_map;` while some `id` entries have `.driver_data = NULL`.
+
+4. **Report when a potentially-NULL pointer is used without such a guarantee**
+
+   Emit a warning when:
+
+   - `P` comes from one of the “possibly-NULL” sources above, and
+   - There exists a control-flow path from the assignment of `P` to an unsafe use of `P` such that:
+     - No dominating, correct NULL check on `P` (as defined in step 3) protects that path, **or**
+     - The only nearby NULL check is on a different pointer expression `Q` that is not provably an alias of `P`.
+
+   Suggested diagnostic message:
+
+   > “Pointer `P` may be NULL (from [API/field/container]); it is dereferenced/used here without a dominating NULL check on `P` (or with a NULL check on a different variable). This can cause a NULL pointer dereference.”
+
+---
+
+### How this unified rule subsumes the given patterns
+
+- **Incomplete guarding in loops**: Pointer from an array is checked in `if (p)` for one use, but later dereferenced unconditionally in the same iteration without early exit → path with `p == NULL` reaches dereference; no dominating guarantee.
+- **Wrong-variable NULL check after allocation**: `p = alloc(); if (!q) ...; use(p);` → check is on `q`, not the alloc result `p`; `p` has no dominating NULL check.
+- **Wrong-field NULL check (`tmp->symbol` vs `list->symbol`)**: Same as above but with struct fields; the check expression differs from the allocated expression.
+- **Unconditional use of `driver_data`**: `ci = id->driver_data; mm = &ci->misc_map;` with some table entries having `.driver_data = NULL` → `ci` comes from a source that may be NULL and is dereferenced without any check.
+- **Missing NULL checks after `ioremap`, `devm_kmalloc`, `kzalloc`, `kvmalloc_array`, etc.**: These functions are modeled as possibly returning NULL; their result is passed to functions or dereferenced with no intervening validation.
+
+By focusing on **(a)** modeling which pointers may be NULL and **(b)** verifying that every dereference is dominated by a correct NULL check on that *same* pointer, this single rule captures all of the provided bug patterns and generalizes well to similar contexts.

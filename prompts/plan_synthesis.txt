@@ -1,20 +1,44 @@
 # Instruction
-Please organize an **elaborate plan** to help write a Clang Static Analyzer (CSA)
-checker to detect such **bug pattern**.
+Please organize an elaborate plan to help write a Clang Static Analyzer (CSA)
+checker to detect the following bug pattern.
 
-Your plan should describe:
-1. The core logic the checker should capture.
-2. The program states and data structures to maintain.
-3. The callback functions (e.g., checkPostCall, checkBranchCondition, checkLocation, checkBind)
-   that will be used and their purposes.
-4. The sequence of steps the checker performs to mark, validate, or report a violation.
+Your plan must:
+
+1. Identify and describe the roles of key expressions:
+   - Allocation/source expression: the expression that may return NULL.
+   - Check/guard expression: the expression used in a NULL check.
+   - Dereference expression: the expression that is dereferenced later.
+
+2. Explain the core logic the checker should capture, including both:
+   - Missing NULL checks on the dereferenced expression.
+   - NULL checks performed on the wrong expression (different from the one dereferenced).
+
+3. Describe the program state and data structures:
+   - How to represent the "maybe-null" status of regions.
+   - How to record which regions have been NULL-checked along a path.
+   - Any simple alias or equivalence information needed between regions.
+
+4. Specify the CSA callbacks and their responsibilities:
+   - checkPostCall: tracking allocation/source results.
+   - checkBranchCondition: identifying NULL checks and mapping them to regions.
+   - checkBind: propagating nullness and aliasing between regions.
+   - checkLocation: detecting dereferences and deciding when to report.
+   - (Optionally) checkDeadSymbols: cleaning up state.
+
+5. Provide a step-by-step description of how, on a given path, the checker:
+   - Sees an allocation/source, marks its result as maybe-null.
+   - Observes any guards and marks the corresponding regions as "checked".
+   - Later sees a dereference, and determines:
+     - If there was no guard for that region, or
+     - If the guard was applied to a different region than the one dereferenced.
+   - Emits a report via a helper like reportUncheckedDereference().
 
 # Utility Functions
 You may assume helper functions like:
-- getMemRegionFromExpr()
-- markRegionChecked()
-- reportUncheckedDereference()
-- ExprHasName()
+- getMemRegionFromExpr(expr)
+- markRegionChecked(region, state)
+- reportUncheckedDereference(derefExpr, allocExpr, guardExpr)
+- ExprHasName(expr, "function_or_variable_name")
 
 # Target Pattern
 {{BUG_PATTERN}}
